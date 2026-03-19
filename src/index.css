@@ -1,15 +1,65 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Space+Grotesk:wght@300..700&display=swap');
 @import "tailwindcss";
 
+@variant dark (&:where(.dark, .dark *));
+
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-family, "Inter", ui-sans-serif, system-ui, sans-serif);
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-serif: "Playfair Display", serif;
+  --font-display: "Space Grotesk", sans-serif;
+}
+
+:root {
+  --bg-color: #fafafa; /* light values */
+  --text-color: #000000;
+  --text-secondary: #52525b; /* zinc-600 */
+  --panel-bg: #ffffff;
+  --border-color: #e4e4e7; /* zinc-200 */
+  --input-bg: #ffffff;
+  --accent-color: #000000;
+  --card-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+}
+
+.dark {
+  --bg-color: #000000; /* dark values */
+  --text-color: #ffffff;
+  --text-secondary: #a1a1aa; /* zinc-400 */
+  --panel-bg: #09090b; /* zinc-950 */
+  --border-color: #18181b; /* zinc-900 */
+  --input-bg: #09090b;
+  --accent-color: #ffffff;
+  --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+}
+
+* {
+  font-family: var(--font-family, "Inter", sans-serif);
 }
 
 body {
-  background-color: #0a0a0a;
-  color: white;
+  background-color: var(--bg-color);
+  color: var(--text-color);
   overflow: hidden;
+  transition: background-color 0.5s cubic-bezier(0.4, 0, 0.2, 1), color 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
 }
 
 ::-webkit-scrollbar {
@@ -21,10 +71,18 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1f1f1f;
+  background: #d4d4d8;
   border-radius: 10px;
 }
 
+.dark ::-webkit-scrollbar-thumb {
+  background: #1f1f1f;
+}
+
 ::-webkit-scrollbar-thumb:hover {
+  background: #a1a1aa;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
   background: #2a2a2a;
 }

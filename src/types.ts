@@ -13,6 +13,8 @@ export interface NostrProfile {
   banner?: string;
 }
 
+export type MessageType = 'text' | 'voice';
+
 export interface Message {
   id: string;
   sender: string;
@@ -20,8 +22,13 @@ export interface Message {
   content: string;
   created_at: number;
   isSelf: boolean;
+  type?: MessageType;
   error?: boolean;
 }
+
+export const KIND_VOICE_NOTE = 1222;
+export const KIND_AUDIO = 1244;
+export const KIND_BLOSSOM_SERVERS = 10063;
 
 export interface Conversation {
   pubkey: string;
@@ -34,7 +41,17 @@ export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
   'wss://relay.snort.social',
-  'wss://purplepag.es'
+  'wss://purplepag.es',
+  'wss://relay.primal.net',
+  'wss://nostr.mom',
+  'wss://relay.current.fyi'
+];
+
+export const INDEXER_RELAYS = [
+  'wss://purplepag.es',
+  'wss://relay.primal.net',
+  'wss://nos.lol',
+  'wss://relay.damus.io'
 ];
 
 export const DEFAULT_DM_RELAYS = [

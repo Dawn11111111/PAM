@@ -1,5 +1,5 @@
 {
   "name": "Pam",
   "description": "Profiles and messages. ",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["microphone"]
 }
