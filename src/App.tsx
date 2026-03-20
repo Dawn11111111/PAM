@@ -46,7 +46,9 @@ import {
   Pause,
   Volume2,
   VolumeX,
-  Volume1
+  Volume1,
+  HardDrive,
+  Download
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { formatDistanceToNow } from 'date-fns';
@@ -81,6 +83,8 @@ export interface Message {
   created_at: number;
   isSelf: boolean;
   type: MessageType;
+  duration?: number;
+  mimeType?: string;
   error?: boolean;
 }
 
@@ -97,13 +101,15 @@ export interface Contact {
 }
 
 // --- Components ---
-const AudioPlayer = ({ src, isSelf }: { src: string; isSelf: boolean }) => {
+const AudioPlayer = ({ src, isSelf, initialDuration }: { src: string; isSelf: boolean; initialDuration?: number }) => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [duration, setDuration] = useState(initialDuration || 0);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
+
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -112,17 +118,37 @@ const AudioPlayer = ({ src, isSelf }: { src: string; isSelf: boolean }) => {
     const updateTime = () => setCurrentTime(audio.currentTime);
     const updateDuration = () => setDuration(audio.duration);
     const onEnded = () => setIsPlaying(false);
+    const onError = (e: any) => {
+      const audio = audioRef.current;
+      let msg = "Failed to load audio source";
+      if (audio?.error) {
+        switch (audio.error.code) {
+          case 1: msg = "Aborted"; break;
+          case 2: msg = "Network error"; break;
+          case 3: msg = "Decoding error"; break;
+          case 4: msg = "Format not supported"; break;
+        }
+      }
+      console.error("Audio error:", e, audio?.error);
+      setError(msg);
+      setIsPlaying(false);
+    };
 
     audio.addEventListener('timeupdate', updateTime);
     audio.addEventListener('loadedmetadata', updateDuration);
     audio.addEventListener('ended', onEnded);
+    audio.addEventListener('error', onError);
+
+    // Reset error when src changes
+    setError(null);
 
     return () => {
       audio.removeEventListener('timeupdate', updateTime);
       audio.removeEventListener('loadedmetadata', updateDuration);
       audio.removeEventListener('ended', onEnded);
+      audio.removeEventListener('error', onError);
     };
-  }, []);
+  }, [src]);
 
   const togglePlay = () => {
     if (audioRef.current) {
@@ -166,46 +192,87 @@ const AudioPlayer = ({ src, isSelf }: { src: string; isSelf: boolean }) => {
 
   return (
     <div className={`flex flex-col gap-2 min-w-[240px] p-2 rounded-none ${isSelf ? 'text-white' : 'text-zinc-900 dark:text-zinc-100'}`}>
-      <audio ref={audioRef} src={src} />
-      <div className="flex items-center gap-3">
-        <button 
-          onClick={togglePlay}
-          className={`p-2 rounded-none transition-colors ${isSelf ? 'hover:bg-white/10' : 'hover:bg-zinc-200 dark:hover:bg-zinc-800'}`}
-        >
-          {isPlaying ? <Pause size={20} /> : <Play size={20} />}
-        </button>
-        
-        <div className="flex-1 flex flex-col gap-1">
-          <input 
-            type="range"
-            min="0"
-            max={duration || 0}
-            step="0.1"
-            value={currentTime}
-            onChange={handleSeek}
-            className={`w-full h-1 rounded-none appearance-none cursor-pointer ${isSelf ? 'bg-white/30 accent-white' : 'bg-zinc-300 dark:bg-zinc-700 accent-emerald-500'}`}
-          />
-          <div className="flex justify-between text-[10px] font-mono opacity-70">
-            <span>{formatTime(currentTime)}</span>
-            <span>{formatTime(duration)}</span>
+      <audio 
+        ref={audioRef} 
+        key={src} 
+        src={src} 
+        preload="metadata" 
+        crossOrigin="anonymous"
+      />
+      {error ? (
+        <div className="flex flex-col gap-2 p-3 bg-red-500/10 border border-red-500/20">
+          <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider">
+            <AlertTriangle size={14} className="text-red-500" />
+            <span className="flex-1 text-red-500">{error}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => { setError(null); audioRef.current?.load(); }}
+              className="flex-1 py-1.5 bg-red-500 text-white text-[9px] font-bold uppercase hover:bg-red-600 transition-colors"
+            >
+              Retry
+            </button>
+            <a 
+              href={src} 
+              download
+              className="flex-1 py-1.5 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 text-[9px] font-bold uppercase text-center hover:bg-zinc-300 dark:hover:bg-zinc-700 transition-colors"
+            >
+              Download
+            </a>
           </div>
         </div>
-      </div>
+      ) : (
+        <>
+          <div className="flex items-center gap-3">
+            <button 
+              onClick={togglePlay}
+              className={`p-2 rounded-none transition-colors ${isSelf ? 'hover:bg-white/10' : 'hover:bg-zinc-200 dark:hover:bg-zinc-800'}`}
+            >
+              {isPlaying ? <Pause size={20} /> : <Play size={20} />}
+            </button>
+            
+            <div className="flex-1 flex flex-col gap-1">
+              <input 
+                type="range"
+                min="0"
+                max={duration || 0}
+                step="0.1"
+                value={currentTime}
+                onChange={handleSeek}
+                className={`w-full h-1 rounded-none appearance-none cursor-pointer ${isSelf ? 'bg-white/30 accent-white' : 'bg-zinc-300 dark:bg-zinc-700 accent-emerald-500'}`}
+              />
+              <div className="flex justify-between text-[10px] font-mono opacity-70">
+                <span>{formatTime(currentTime)}</span>
+                <span>{formatTime(duration)}</span>
+              </div>
+            </div>
 
-      <div className="flex items-center gap-3 px-2">
-        <button onClick={toggleMute} className="opacity-70 hover:opacity-100 transition-opacity">
-          {isMuted || volume === 0 ? <VolumeX size={14} /> : volume < 0.5 ? <Volume1 size={14} /> : <Volume2 size={14} />}
-        </button>
-        <input 
-          type="range"
-          min="0"
-          max="1"
-          step="0.1"
-          value={isMuted ? 0 : volume}
-          onChange={handleVolumeChange}
-          className={`w-16 h-1 rounded-none appearance-none cursor-pointer ${isSelf ? 'bg-white/30 accent-white' : 'bg-zinc-300 dark:bg-zinc-700 accent-emerald-500'}`}
-        />
-      </div>
+            <a 
+              href={src} 
+              download
+              className={`p-2 rounded-none transition-colors ${isSelf ? 'hover:bg-white/10' : 'hover:bg-zinc-200 dark:hover:bg-zinc-800'}`}
+              title="Download Audio"
+            >
+              <Download size={16} />
+            </a>
+          </div>
+
+          <div className="flex items-center gap-3 px-2">
+            <button onClick={toggleMute} className="opacity-70 hover:opacity-100 transition-opacity">
+              {isMuted || volume === 0 ? <VolumeX size={14} /> : volume < 0.5 ? <Volume1 size={14} /> : <Volume2 size={14} />}
+            </button>
+            <input 
+              type="range"
+              min="0"
+              max="1"
+              step="0.1"
+              value={isMuted ? 0 : volume}
+              onChange={handleVolumeChange}
+              className={`w-16 h-1 rounded-none appearance-none cursor-pointer ${isSelf ? 'bg-white/30 accent-white' : 'bg-zinc-300 dark:bg-zinc-700 accent-emerald-500'}`}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 };
@@ -242,6 +309,7 @@ const INDEXER_RELAYS = ['wss://purplepag.es', 'wss://relay.nos.social'];
 const KIND_DM = 14;
 const KIND_SEAL = 13;
 const KIND_GIFT_WRAP = 1059;
+const KIND_BLOSSOM_LIST = 10063;
 
 // --- Utilities ---
 const publishWithTimeout = async (pool: SimplePool, relays: string[], event: Event, timeout = 5000) => {
@@ -337,6 +405,18 @@ export default function App() {
     'https://nostr.download',
     'https://blossom.primal.net'
   ]);
+  const [userBlossomServers, setUserBlossomServers] = useState<string[]>(() => {
+    const saved = localStorage.getItem('pam_blossom_servers');
+    return saved ? JSON.parse(saved) : [
+      'https://blossom.band',
+      'https://satellite.earth',
+      'https://blossom.hazel.city',
+      'https://blossom.jmoore.me',
+      'https://nostr.download',
+      'https://blossom.primal.net'
+    ];
+  });
+  const [preferredBlossomServer, setPreferredBlossomServer] = useState<string | null>(() => localStorage.getItem('pam_preferred_blossom'));
   const [powDifficulty, setPowDifficulty] = useState(0);
   const [isMining, setIsMining] = useState(false);
   const [isDecrypting, setIsDecrypting] = useState(false);
@@ -361,15 +441,16 @@ export default function App() {
   });
   const [deleteConfirmPk, setDeleteConfirmPk] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(0);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [recordingDuration, setRecordingDuration] = useState(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingIntervalRef = useRef<number | null>(null);
   const [viewingRelays, setViewingRelays] = useState<string[]>([]);
   const [isViewingDefaultRelays, setIsViewingDefaultRelays] = useState(false);
   const [relayInfoCache, setRelayInfoCache] = useState<Record<string, any>>({});
   const [newRelayUrl, setNewRelayUrl] = useState('');
+  const [newBlossomUrl, setNewBlossomUrl] = useState('');
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
 
   const fetchRelayInfo = useCallback(async (url: string) => {
@@ -402,6 +483,35 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // --- Logic ---
+  const fetchBlossomServers = useCallback(async (pk: string) => {
+    const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
+    const event = await pool.current.get(relays, { kinds: [KIND_BLOSSOM_LIST], authors: [pk] });
+    if (event) {
+      const servers = event.tags.filter(t => t[0] === 'server').map(t => t[1]);
+      if (servers.length > 0) {
+        setUserBlossomServers(servers);
+        localStorage.setItem('pam_blossom_servers', JSON.stringify(servers));
+      }
+    }
+  }, [userDmRelays]);
+
+  const saveBlossomServers = async (servers: string[]) => {
+    if (!pubKey || !privKey) return;
+    const event: UnsignedEvent = {
+      kind: KIND_BLOSSOM_LIST,
+      pubkey: pubKey,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: servers.map(s => ['server', s]),
+      content: ''
+    };
+    const signed = await signEvent(event);
+    const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
+    await publishWithTimeout(pool.current, relays, signed);
+    setUserBlossomServers(servers);
+    localStorage.setItem('pam_blossom_servers', JSON.stringify(servers));
+    showToast("Blossom servers saved", "success");
+  };
+
   const fetchProfile = useCallback(async (pk: string, force = false, customRelays?: string[]) => {
     if (!force) {
       const cached = await localDb.profiles.get(pk);
@@ -424,6 +534,13 @@ export default function App() {
   }, [pubKey, userDmRelays]);
 
   // --- Effects ---
+  useEffect(() => {
+    if (pubKey) {
+      fetchProfile(pubKey);
+      fetchBlossomServers(pubKey);
+    }
+  }, [pubKey, fetchProfile, fetchBlossomServers]);
+
   useEffect(() => {
     localStorage.setItem('pam_theme', theme);
     if (theme === 'dark') {
@@ -569,6 +686,9 @@ export default function App() {
           const receiverTag = rumor.tags.find((t: any) => t[0] === 'p');
           const receiver = receiverTag ? receiverTag[1] : pubKey;
           
+          const durationTag = rumor.tags.find((t: any) => t[0] === 'duration');
+          const mimeTypeTag = rumor.tags.find((t: any) => t[0] === 'm');
+
           const msg: Message = {
             id: rumor.id || event.id, // Prefer Rumor ID for deduplication
             sender: rumor.pubkey,
@@ -577,7 +697,9 @@ export default function App() {
             created_at: rumor.created_at,
             isSelf: rumor.pubkey === pubKey,
             type: rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'image') ? 'image' : 
-                  (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'voice') || rumor.kind === 1222) ? 'voice' : 'text'
+                  (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'voice') || rumor.kind === 1222) ? 'voice' : 'text',
+            duration: durationTag ? parseInt(durationTag[1]) : undefined,
+            mimeType: mimeTypeTag ? mimeTypeTag[1] : undefined
           };
           
           setMessages(prev => {
@@ -624,6 +746,9 @@ export default function App() {
             const receiverTag = rumor.tags.find((t: any) => t[0] === 'p');
             const receiver = receiverTag ? receiverTag[1] : pubKey;
 
+            const durationTag = rumor.tags.find((t: any) => t[0] === 'duration');
+            const mimeTypeTag = rumor.tags.find((t: any) => t[0] === 'm');
+
             const msg: Message = {
               id: rumor.id || event.id, // Prefer Rumor ID for deduplication
               sender: rumor.pubkey,
@@ -632,7 +757,9 @@ export default function App() {
               created_at: rumor.created_at,
               isSelf: rumor.pubkey === pubKey,
               type: rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'image') ? 'image' : 
-                    (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'voice') || rumor.kind === 1222) ? 'voice' : 'text'
+                    (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'voice') || rumor.kind === 1222) ? 'voice' : 'text',
+              duration: durationTag ? parseInt(durationTag[1]) : undefined,
+              mimeType: mimeTypeTag ? mimeTypeTag[1] : undefined
             };
 
             if (notificationsEnabled && !msg.isSelf && activeChat !== msg.sender) {
@@ -699,7 +826,21 @@ export default function App() {
     return leadingZeros >= difficulty;
   };
 
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  };
+
   const uploadToBlossom = async (blob: Blob): Promise<string> => {
+    if (blob.size === 0) {
+      console.error("Attempted to upload an empty blob to Blossom");
+      throw new Error("Cannot upload empty file. Recording may have failed.");
+    }
+    
     if (!privKey || !pubKey) throw new Error("Keys missing");
     
     const buffer = await blob.arrayBuffer();
@@ -707,20 +848,29 @@ export default function App() {
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     
-    // Curated list of reliable Blossom servers with good CORS support
-    const servers = [...new Set([...blossomServers])];
+    let servers = [...new Set([...userBlossomServers])];
+    if (preferredBlossomServer && servers.includes(preferredBlossomServer)) {
+      servers = [preferredBlossomServer, ...servers.filter(s => s !== preferredBlossomServer)];
+    }
     console.log(`Starting upload to Blossom servers: ${servers.join(', ')}`);
     
     for (const server of servers) {
       const normalizedServer = server.endsWith('/') ? server.slice(0, -1) : server;
       try {
-        console.log(`Attempting upload to ${normalizedServer}...`);
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => {
-          console.warn(`Upload to ${normalizedServer} timed out after 30s`);
-          controller.abort();
-        }, 30000);
+        // 1. Check if blob already exists
+        try {
+          const checkResponse = await fetch(`${normalizedServer}/${hashHex}`, { method: 'HEAD' });
+          if (checkResponse.ok) {
+            console.log(`Blob already exists on ${normalizedServer}`);
+            return `${normalizedServer}/${hashHex}`;
+          }
+        } catch (e) {
+          // HEAD might fail due to CORS even if GET works, or server might not support it
+          console.log(`HEAD check failed for ${normalizedServer}, proceeding with upload attempt`);
+        }
 
+        console.log(`Attempting upload to ${normalizedServer}...`);
+        
         const authEvent: UnsignedEvent = {
           kind: 24242,
           pubkey: pubKey,
@@ -737,75 +887,78 @@ export default function App() {
         const signedAuth = await signEvent(authEvent);
         const authHeader = btoa(unescape(encodeURIComponent(JSON.stringify(signedAuth))));
 
-        // Try POST /upload first
-        const response = await fetch(`${normalizedServer}/upload`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Nostr ${authHeader}`,
-            'Content-Type': blob.type || 'application/octet-stream'
-          },
-          body: blob,
-          mode: 'cors',
-          signal: controller.signal
-        });
-        
-        clearTimeout(timeoutId);
+        // Try POST /upload
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-        if (response.ok) {
-          console.log(`Successfully uploaded to ${normalizedServer} via POST`);
-          try {
+        try {
+          const response = await fetch(`${normalizedServer}/upload`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Nostr ${authHeader}`,
+              'Content-Type': blob.type || 'application/octet-stream'
+            },
+            body: blob,
+            mode: 'cors',
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeoutId);
+
+          if (response.ok) {
+            console.log(`Successfully uploaded to ${normalizedServer} via POST`);
             const result = await response.json();
             return result.url || `${normalizedServer}/${hashHex}`;
-          } catch (jsonErr) {
-            return `${normalizedServer}/${hashHex}`;
           }
-        } else if (response.status === 413) {
-          console.error(`File too large for ${normalizedServer} (413)`);
-          continue;
+        } catch (postErr) {
+          console.warn(`POST to ${normalizedServer} failed:`, postErr);
         }
-        
-        console.log(`POST to ${normalizedServer} failed with status ${response.status}. Trying PUT...`);
-        
-        // Fallback to PUT if POST fails
-        const putController = new AbortController();
-        const putTimeoutId = setTimeout(() => {
-          console.warn(`PUT to ${normalizedServer} timed out after 30s`);
-          putController.abort();
-        }, 30000);
 
-        const putAuthEvent = { ...authEvent, tags: [...authEvent.tags.filter(t => t[0] !== 'u'), ['u', `${normalizedServer}/${hashHex}`]] };
+        // 2. Fallback to PUT if POST fails
+        const putAuthEvent = { 
+          ...authEvent, 
+          tags: [
+            ...authEvent.tags.filter(t => t[0] !== 'u'), 
+            ['u', `${normalizedServer}/${hashHex}`]
+          ] 
+        };
         const signedPutAuth = await signEvent(putAuthEvent);
         const putAuthHeader = btoa(unescape(encodeURIComponent(JSON.stringify(signedPutAuth))));
 
-        const putResponse = await fetch(`${normalizedServer}/${hashHex}`, {
-          method: 'PUT',
-          headers: {
-            'Authorization': `Nostr ${putAuthHeader}`,
-            'Content-Type': blob.type || 'application/octet-stream'
-          },
-          body: blob,
-          mode: 'cors',
-          signal: putController.signal
-        });
+        const putController = new AbortController();
+        const putTimeoutId = setTimeout(() => putController.abort(), 30000);
 
-        clearTimeout(putTimeoutId);
+        try {
+          const putResponse = await fetch(`${normalizedServer}/${hashHex}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Nostr ${putAuthHeader}`,
+              'Content-Type': blob.type || 'application/octet-stream'
+            },
+            body: blob,
+            mode: 'cors',
+            signal: putController.signal
+          });
 
-        if (putResponse.ok) {
-          console.log(`Successfully uploaded to ${normalizedServer} via PUT`);
-          return `${normalizedServer}/${hashHex}`;
-        } else {
-          console.warn(`PUT to ${normalizedServer} failed with status ${putResponse.status}`);
+          clearTimeout(putTimeoutId);
+
+          if (putResponse.ok) {
+            console.log(`Successfully uploaded to ${normalizedServer} via PUT`);
+            return `${normalizedServer}/${hashHex}`;
+          }
+        } catch (putErr) {
+          console.warn(`PUT to ${normalizedServer} failed:`, putErr);
         }
       } catch (err) {
         console.error(`Failed to upload to ${normalizedServer}:`, err);
       }
     }
     
-    showToast("Failed to upload image to any server", "error");
-    throw new Error("Failed to upload to any Blossom server. This is often due to CORS restrictions on the server side. Try again or check your network connection.");
+    showToast("Failed to upload to any Blossom server", "error");
+    throw new Error("Upload failed. Check your network or try adding a different media server in Settings.");
   };
 
-  const sendMessage = async (content = newMessage, type: MessageType = 'text') => {
+  const sendMessage = async (content = newMessage, type: MessageType = 'text', duration?: number, mimeType?: string) => {
     if (!activeChat || !pubKey || !privKey) return;
     const text = content.trim();
     if (!text && type === 'text') return;
@@ -832,7 +985,11 @@ export default function App() {
         content: text 
       };
       if (type === 'image') rumorTemplate.tags.push(['t', 'image']);
-      if (type === 'voice') rumorTemplate.tags.push(['t', 'voice']);
+      if (type === 'voice') {
+        rumorTemplate.tags.push(['t', 'voice']);
+        if (duration) rumorTemplate.tags.push(['duration', duration.toString()]);
+        if (mimeType) rumorTemplate.tags.push(['m', mimeType]);
+      }
       const rumor = { ...rumorTemplate, id: getEventHash(rumorTemplate) };
       
       // 1. Create Seals (KIND 13)
@@ -953,30 +1110,104 @@ export default function App() {
     showToast("Relay removed", "success");
   };
 
+  const addBlossomServer = () => {
+    if (!newBlossomUrl.trim()) return;
+    let url = newBlossomUrl.trim();
+    if (!url.startsWith('http')) url = `https://${url}`;
+    if (url.endsWith('/')) url = url.slice(0, -1);
+    
+    if (userBlossomServers.includes(url)) {
+      showToast("Server already added", "info");
+      return;
+    }
+    
+    const updated = [...userBlossomServers, url];
+    setUserBlossomServers(updated);
+    localStorage.setItem('pam_blossom_servers', JSON.stringify(updated));
+    setNewBlossomUrl('');
+    showToast("Blossom server added locally", "success");
+  };
+
+  const removeBlossomServer = (url: string) => {
+    const updated = userBlossomServers.filter(s => s !== url);
+    setUserBlossomServers(updated);
+    localStorage.setItem('pam_blossom_servers', JSON.stringify(updated));
+    showToast("Blossom server removed locally", "success");
+  };
+
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
+      if (stream.getAudioTracks().length === 0) {
+        throw new Error("No audio tracks found in stream");
+      }
+      
+      // Find a supported mime type
+      const mimeTypes = [
+        'audio/mp4',
+        'audio/aac',
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus'
+      ];
+      const supportedType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || '';
+      
+      console.log(`Starting recording with mimeType: ${supportedType || 'default'}`);
+      const options: MediaRecorderOptions = {
+        audioBitsPerSecond: 16000 // 16kbps is perfect for voice and fits NIP-44 limits
+      };
+      if (supportedType) options.mimeType = supportedType;
+
+      const mediaRecorder = new MediaRecorder(stream, options);
       mediaRecorderRef.current = mediaRecorder;
       const chunks: BlobPart[] = [];
 
       mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
+        if (e.data.size > 0) {
+          chunks.push(e.data);
+          console.log(`Data available: ${e.data.size} bytes. Total chunks: ${chunks.length}`);
+        } else {
+          console.warn("Data available but size is 0");
+        }
+      };
+
+      mediaRecorder.onstart = () => {
+        setIsRecording(true);
+        setRecordingDuration(0);
+        recordingIntervalRef.current = window.setInterval(() => {
+          setRecordingDuration(prev => {
+            if (prev >= 20) {
+              stopRecording();
+              return prev;
+            }
+            return prev + 1;
+          });
+        }, 1000);
       };
 
       mediaRecorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        setAudioBlob(blob);
-        setAudioUrl(URL.createObjectURL(blob));
+        if (recordingIntervalRef.current) {
+          clearInterval(recordingIntervalRef.current);
+          recordingIntervalRef.current = null;
+        }
+        setIsRecording(false);
+        const finalType = mediaRecorder.mimeType || supportedType || 'audio/webm';
+        const blob = new Blob(chunks, { type: finalType });
+        console.log(`Recording stopped. Final Type: ${finalType}, Total chunks: ${chunks.length}, Blob size: ${blob.size} bytes`);
+        
+        if (blob.size === 0) {
+          console.error("CRITICAL: Recording resulted in an empty blob!");
+          showToast("Recording failed: No audio data captured. Please check microphone permissions.", "error");
+          setAudioBlob(null);
+          setAudioUrl(null);
+        } else {
+          setAudioBlob(blob);
+          setAudioUrl(URL.createObjectURL(blob));
+        }
         stream.getTracks().forEach(track => track.stop());
       };
 
-      mediaRecorder.start();
-      setIsRecording(true);
-      setRecordingDuration(0);
-      recordingIntervalRef.current = window.setInterval(() => {
-        setRecordingDuration(prev => prev + 1);
-      }, 1000);
+      mediaRecorder.start(500); // Capture data every 500ms for better reliability
     } catch (err) {
       console.error("Failed to start recording", err);
       showToast("Could not access microphone", "error");
@@ -1417,7 +1648,7 @@ export default function App() {
             <div className="pt-4">
               <button 
                 onClick={() => loginLocal(generateSecretKey())} 
-                className="w-full py-4 bg-black dark:bg-white text-white dark:text-black font-bold rounded-none hover:bg-zinc-800 dark:hover:bg-zinc-200 transition-all active:scale-95 shadow-lg shadow-emerald-500/10"
+                className="w-full py-4 bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white font-bold rounded-none hover:opacity-90 transition-all active:scale-95 shadow-lg shadow-emerald-500/20"
               >
                 Start New Identity
               </button>
@@ -1500,7 +1731,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <button 
               onClick={() => setSelectedProfile(pubKey)}
-              className="w-10 h-10 rounded-none bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 transition-colors"
+              className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 transition-colors"
             >
               {profile?.picture ? <img src={profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <div className="w-full h-full flex items-center justify-center"><User size={20} className="text-zinc-400 dark:text-zinc-600" /></div>}
             </button>
@@ -1563,7 +1794,7 @@ export default function App() {
                   <p className="px-2 py-1 text-[9px] font-bold text-emerald-500 uppercase tracking-widest">Global Search Results</p>
                   {searchResults.map(res => (
                     <button key={res.pubkey} onClick={() => setSelectedProfile(res.pubkey)} className="w-full p-2 flex items-center gap-3 hover:bg-zinc-50 dark:hover:bg-zinc-900 rounded-none text-left transition-colors group">
-                      <div className="w-10 h-10 rounded-none bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 shrink-0">
+                      <div className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 shrink-0">
                         {res.profile?.picture ? <img src={res.profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={20} className="m-auto text-zinc-400 dark:text-zinc-600" />}
                       </div>
                       <div className="flex-1 min-w-0">
@@ -1587,7 +1818,7 @@ export default function App() {
                   >
                     <button 
                       onClick={(e) => { e.stopPropagation(); setSelectedProfile(contact.pubkey); }}
-                      className="w-10 h-10 rounded-none bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 shrink-0 hover:border-emerald-500 transition-colors"
+                      className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 shrink-0 hover:border-emerald-500 transition-colors"
                     >
                       {contact.profile?.picture ? <img src={contact.profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={20} className="m-auto text-zinc-400 dark:text-zinc-600" />}
                     </button>
@@ -1624,7 +1855,7 @@ export default function App() {
                   >
                     <button 
                       onClick={(e) => { e.stopPropagation(); setSelectedProfile(conv.pubkey); }}
-                      className="w-12 h-12 rounded-none bg-zinc-100 dark:bg-zinc-900 overflow-hidden relative border border-zinc-200 dark:border-zinc-800 shrink-0 hover:border-emerald-500 transition-colors"
+                      className="w-12 h-12 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden relative border border-zinc-200 dark:border-zinc-800 shrink-0 hover:border-emerald-500 transition-colors"
                     >
                       {conv.profile?.picture ? <img src={conv.profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={24} className="m-auto text-zinc-400 dark:text-zinc-600" />}
                       {conv.unreadCount > 0 && <div className="absolute top-0 right-0 w-4 h-4 bg-emerald-500 text-white rounded-none text-[8px] font-bold flex items-center justify-center border-2 border-white dark:border-black">{conv.unreadCount}</div>}
@@ -1672,7 +1903,7 @@ export default function App() {
                 <button onClick={() => setActiveChat(null)} className="md:hidden p-2 text-zinc-400 dark:text-zinc-500 hover:text-emerald-500"><ArrowLeft size={20} /></button>
                 <button 
                   onClick={() => setSelectedProfile(activeChat)}
-                  className="w-10 h-10 rounded-none bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 transition-colors"
+                  className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 transition-colors"
                 >
                   {conversations.find(c => c.pubkey === activeChat)?.profile?.picture ? <img src={conversations.find(c => c.pubkey === activeChat)?.profile?.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={20} className="m-auto text-zinc-400 dark:text-zinc-600" />}
                 </button>
@@ -1697,7 +1928,7 @@ export default function App() {
               {messages.filter(m => (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id)).map(msg => (
                 <div key={msg.id} className={`flex flex-col ${msg.isSelf ? 'items-end' : 'items-start'}`}>
                   <div 
-                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed ${msg.isSelf ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/20' : 'bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white border border-zinc-200 dark:border-zinc-800'}`}
+                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed ${msg.isSelf ? 'bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white shadow-lg shadow-emerald-500/20' : 'bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 text-black dark:text-white border border-zinc-200 dark:border-zinc-800'}`}
                   >
                     {msg.type === 'image' ? (
                       <div className="space-y-2">
@@ -1705,7 +1936,7 @@ export default function App() {
                         <a href={msg.content} target="_blank" rel="noopener noreferrer" className="text-[10px] underline opacity-50 hover:opacity-100 block">View original</a>
                       </div>
                     ) : msg.type === 'voice' ? (
-                      <AudioPlayer src={msg.content} isSelf={msg.isSelf} />
+                      <AudioPlayer src={msg.content} isSelf={msg.isSelf} initialDuration={msg.duration} />
                     ) : (
                       msg.content
                     )}
@@ -1737,7 +1968,7 @@ export default function App() {
                   {isRecording ? (
                     <div className="flex-1 flex items-center gap-4 px-6 py-4 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900 transition-all animate-pulse">
                       <div className="w-2 h-2 rounded-full bg-red-500" />
-                      <span className="flex-1 text-sm font-mono text-red-500 font-bold tracking-widest">{formatDuration(recordingDuration)}</span>
+                      <span className="flex-1 text-sm font-mono text-red-500 font-bold tracking-widest">{formatDuration(recordingDuration)} / 0:20</span>
                       <button 
                         onClick={stopRecording}
                         className="p-2 text-red-500 hover:bg-red-500/10 transition-colors"
@@ -1791,13 +2022,35 @@ export default function App() {
                   />
 
                   {!isRecording && !audioUrl && (
-                    <button 
-                      onClick={() => document.getElementById('image-upload')?.click()} 
-                      className="p-4 bg-zinc-100 dark:bg-zinc-900 text-zinc-400 dark:text-zinc-500 rounded-none hover:text-emerald-500 transition-colors"
-                      title="Upload Image"
-                    >
-                      <ImageIcon size={20} />
-                    </button>
+                    <div className="relative group">
+                      <button 
+                        onClick={() => document.getElementById('image-upload')?.click()} 
+                        className="p-4 bg-zinc-100 dark:bg-zinc-900 text-zinc-400 dark:text-zinc-500 rounded-none hover:text-emerald-500 transition-colors"
+                        title="Upload Image"
+                      >
+                        <ImageIcon size={20} />
+                      </button>
+                      {userBlossomServers.length > 1 && (
+                        <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-20">
+                          <div className="bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 shadow-xl p-2 min-w-[160px] space-y-1">
+                            <p className="text-[8px] font-bold text-zinc-400 uppercase tracking-widest px-2 pb-1 border-b border-zinc-100 dark:border-zinc-900">Upload Server</p>
+                            {userBlossomServers.map(server => (
+                              <button
+                                key={server}
+                                onClick={() => {
+                                  setPreferredBlossomServer(server);
+                                  localStorage.setItem('pam_preferred_blossom', server);
+                                }}
+                                className={`w-full text-left px-2 py-1.5 text-[9px] font-medium transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-900 flex items-center justify-between ${preferredBlossomServer === server ? 'text-emerald-500' : 'text-zinc-500'}`}
+                              >
+                                <span className="truncate max-w-[120px]">{server.replace('https://', '')}</span>
+                                {preferredBlossomServer === server && <Check size={10} />}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   )}
 
                   {!isRecording && !audioUrl && (
@@ -1814,22 +2067,26 @@ export default function App() {
                     <button 
                       onClick={async () => {
                         if (audioUrl && audioBlob) {
-                          setIsUploading(true);
                           try {
-                            const url = await uploadToBlossom(audioBlob);
-                            await sendMessage(url, 'voice');
+                            const base64 = await blobToBase64(audioBlob);
+                            // NIP-44 limit is 65535 bytes. Base64 adds ~33% overhead.
+                            // We should check the final string length.
+                            if (base64.length > 60000) {
+                              showToast("Voice note too long (max ~20s). Please record a shorter message.", "error");
+                              return;
+                            }
+                            await sendMessage(base64, 'voice', recordingDuration, audioBlob.type);
                             discardRecording();
                           } catch (err) {
-                            alert("Failed to upload voice message: " + (err instanceof Error ? err.message : String(err)));
-                          } finally {
-                            setIsUploading(false);
+                            console.error("Failed to send voice message:", err);
+                            showToast("Failed to process voice message", "error");
                           }
                         } else {
                           sendMessage();
                         }
                       }} 
                       disabled={isMining || isUploading} 
-                      className="p-4 bg-emerald-500 text-white rounded-none disabled:opacity-50 hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/20"
+                      className="p-4 bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white rounded-none disabled:opacity-50 hover:opacity-90 transition-all shadow-lg shadow-emerald-500/20"
                     >
                       {isMining || isUploading ? <Loader2 size={20} className="animate-spin" /> : <Send size={20} />}
                     </button>
@@ -1873,8 +2130,8 @@ export default function App() {
 
               {/* Profile Info */}
               <div className="px-6 pb-8 -mt-12 relative">
-                <div className="w-24 h-24 rounded-none bg-white dark:bg-zinc-950 p-1 border border-zinc-200 dark:border-zinc-900 mb-4">
-                  <div className="w-full h-full bg-zinc-100 dark:bg-zinc-900 overflow-hidden flex items-center justify-center">
+                <div className="w-24 h-24 hexagon bg-white dark:bg-zinc-950 p-1 border border-zinc-200 dark:border-zinc-900 mb-4">
+                  <div className="w-full h-full hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden flex items-center justify-center">
                     {!viewingProfile ? (
                       <Loader2 size={32} className="animate-spin text-emerald-500/20" />
                     ) : viewingProfile?.picture ? (
@@ -2057,7 +2314,7 @@ export default function App() {
                   <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Identity</p>
                   <div className="p-4 bg-zinc-50 dark:bg-zinc-900 rounded-none border border-zinc-200 dark:border-zinc-800 space-y-3">
                     <div className="flex items-center gap-3">
-                      <div className="w-12 h-12 rounded-none bg-zinc-100 dark:bg-black border border-zinc-200 dark:border-zinc-800 overflow-hidden">
+                      <div className="w-12 h-12 hexagon bg-zinc-100 dark:bg-black border border-zinc-200 dark:border-zinc-800 overflow-hidden">
                         {profile?.picture ? <img src={profile.picture} alt="" className="w-full h-full object-cover" /> : <User size={24} className="m-auto text-zinc-400 dark:text-zinc-700" />}
                       </div>
                       <div className="min-w-0">
@@ -2201,6 +2458,64 @@ export default function App() {
                 </div>
 
                 <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Media Servers (Blossom)</p>
+                    <button 
+                      onClick={() => saveBlossomServers(userBlossomServers)}
+                      className="text-[8px] font-bold text-emerald-500 uppercase tracking-widest hover:underline"
+                    >
+                      Publish to Nostr
+                    </button>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex gap-2">
+                      <input 
+                        type="text" 
+                        value={newBlossomUrl}
+                        onChange={(e) => setNewBlossomUrl(e.target.value)}
+                        placeholder="https://blossom.example.com"
+                        className="flex-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors"
+                        onKeyDown={(e) => e.key === 'Enter' && addBlossomServer()}
+                      />
+                      <button 
+                        onClick={addBlossomServer}
+                        className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
+                      >
+                        Add
+                      </button>
+                    </div>
+
+                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
+                      {userBlossomServers.length > 0 ? (
+                        userBlossomServers.map(url => (
+                          <div key={url} className="flex items-center justify-between p-2 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 group">
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div className="w-6 h-6 shrink-0 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 flex items-center justify-center overflow-hidden">
+                                <HardDrive size={12} className="text-zinc-300 dark:text-zinc-700" />
+                              </div>
+                              <div className="min-w-0">
+                                <p className="text-[10px] font-bold truncate">{url.replace('https://', '').replace('http://', '')}</p>
+                                <p className="text-[8px] text-zinc-500 font-mono truncate">{url}</p>
+                              </div>
+                            </div>
+                            <button 
+                              onClick={() => removeBlossomServer(url)}
+                              className="p-1.5 text-zinc-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                            >
+                              <X size={14} />
+                            </button>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="p-4 text-center border border-dashed border-zinc-200 dark:border-zinc-800 opacity-50">
+                          <p className="text-[10px] uppercase tracking-widest font-bold">No servers configured</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
                   <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Notifications</p>
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-zinc-400">Enable Desktop Notifications</span>
@@ -2273,7 +2588,7 @@ export default function App() {
           <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute inset-0 bg-black/80 dark:bg-black/95 backdrop-blur-xl" />
             <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none text-center space-y-8 shadow-2xl">
-              <div className="w-20 h-20 bg-zinc-100 dark:bg-zinc-900 rounded-none flex items-center justify-center mx-auto border border-zinc-200 dark:border-zinc-800">
+              <div className="w-20 h-20 hexagon bg-zinc-100 dark:bg-zinc-900 flex items-center justify-center mx-auto border border-zinc-200 dark:border-zinc-800">
                 <Unlock size={32} className="text-emerald-500" />
               </div>
               <div className="space-y-2">
