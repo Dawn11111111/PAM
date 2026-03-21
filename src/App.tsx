@@ -59,6 +59,14 @@ declare global {
     nostr?: {
       getPublicKey(): Promise<string>;
       signEvent(event: any): Promise<any>;
+      nip04?: {
+        encrypt(pubkey: string, plaintext: string): Promise<string>;
+        decrypt(pubkey: string, ciphertext: string): Promise<string>;
+      };
+      nip44?: {
+        encrypt(pubkey: string, plaintext: string): Promise<string>;
+        decrypt(pubkey: string, ciphertext: string): Promise<string>;
+      };
     };
   }
 }
@@ -101,178 +109,289 @@ export interface Contact {
 }
 
 // --- Components ---
-const AudioPlayer = ({ src, isSelf, initialDuration }: { src: string; isSelf: boolean; initialDuration?: number }) => {
+const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; isSelf: boolean; initialDuration?: number; mimeType?: string }) => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(initialDuration || 0);
-  const [volume, setVolume] = useState(1);
-  const [isMuted, setIsMuted] = useState(false);
-
   const [error, setError] = useState<string | null>(null);
+  const [waveform, setWaveform] = useState<number[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [currentSrc, setCurrentSrc] = useState<string | null>(null);
 
+  // Handle src changes and initial setup
+  useEffect(() => {
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setError(null);
+    setWaveform([]);
+    
+    // If it's already a blob, use it immediately
+    if (src.startsWith('blob:')) {
+      setCurrentSrc(src);
+    } else {
+      setCurrentSrc(null); // Wait for processAudio to fetch and create a local blob
+    }
+    
+    processAudio(src);
+  }, [src]);
+
+  // Handle audio element events and loading
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     const updateTime = () => setCurrentTime(audio.currentTime);
-    const updateDuration = () => setDuration(audio.duration);
+    const updateDuration = () => {
+      if (audio.duration && audio.duration !== Infinity) {
+        setDuration(audio.duration);
+      }
+    };
     const onEnded = () => setIsPlaying(false);
     const onError = (e: any) => {
-      const audio = audioRef.current;
-      let msg = "Failed to load audio source";
-      if (audio?.error) {
+      // Ignore errors if we haven't even set a source yet
+      if (!currentSrc) return;
+      
+      console.error("AudioPlayer Error:", {
+        code: audio.error?.code,
+        message: audio.error?.message,
+        currentSrc,
+        originalSrc: src,
+        mimeType,
+        event: e
+      });
+      
+      if (audio.error) {
+        let msg = "Playback error";
         switch (audio.error.code) {
-          case 1: msg = "Aborted"; break;
+          case 1: msg = "Playback aborted"; break;
           case 2: msg = "Network error"; break;
           case 3: msg = "Decoding error"; break;
           case 4: msg = "Format not supported"; break;
         }
+        setError(msg);
       }
-      console.error("Audio error:", e, audio?.error);
-      setError(msg);
       setIsPlaying(false);
     };
 
     audio.addEventListener('timeupdate', updateTime);
     audio.addEventListener('loadedmetadata', updateDuration);
+    audio.addEventListener('durationchange', updateDuration);
     audio.addEventListener('ended', onEnded);
     audio.addEventListener('error', onError);
 
-    // Reset error when src changes
-    setError(null);
+    // Force load when currentSrc is set
+    // No longer needed as key={currentSrc} forces a fresh load on re-mount
+    // which is more reliable for clearing error states.
 
     return () => {
       audio.removeEventListener('timeupdate', updateTime);
       audio.removeEventListener('loadedmetadata', updateDuration);
+      audio.removeEventListener('durationchange', updateDuration);
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('error', onError);
     };
-  }, [src]);
+  }, [currentSrc]);
 
-  const togglePlay = () => {
-    if (audioRef.current) {
-      if (isPlaying) audioRef.current.pause();
-      else audioRef.current.play();
-      setIsPlaying(!isPlaying);
+  const processAudio = async (audioUrl: string) => {
+    if (!audioUrl) return;
+    setIsLoading(true);
+    
+    try {
+      // 1. Fetch the audio data
+      // This helps bypass range request issues and allows us to fix MIME types
+      const response = await fetch(audioUrl);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      
+      let blob = await response.blob();
+      
+      // 2. Fix MIME type if generic or missing
+      const effectiveMimeType = mimeType || 'audio/webm';
+      if (blob.type === 'application/octet-stream' || !blob.type || (mimeType && blob.type !== mimeType)) {
+        blob = new Blob([blob], { type: effectiveMimeType });
+      }
+      
+      // 3. Create a local URL for playback
+      // We always create a new local URL for the fetched blob to ensure 
+      // consistent playback and to avoid issues with original URLs.
+      const localUrl = URL.createObjectURL(blob);
+      setCurrentSrc(localUrl);
+
+      // 4. Generate Waveform
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      
+      try {
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const rawData = audioBuffer.getChannelData(0);
+        const samples = 60;
+        const blockSize = Math.floor(rawData.length / samples);
+        const filteredData = [];
+        for (let i = 0; i < samples; i++) {
+          let blockStart = blockSize * i;
+          let sum = 0;
+          for (let j = 0; j < blockSize; j++) {
+            sum = sum + Math.abs(rawData[blockStart + j]);
+          }
+          filteredData.push(sum / blockSize);
+        }
+        const multiplier = Math.pow(Math.max(...filteredData), -1);
+        setWaveform(filteredData.map(n => n * multiplier));
+      } catch (decodeErr) {
+        console.warn("Audio decoding for waveform failed:", decodeErr);
+        setWaveform(Array.from({ length: 60 }, () => Math.random() * 0.5 + 0.1));
+      } finally {
+        await audioCtx.close();
+      }
+    } catch (e) {
+      console.warn("Audio processing failed, falling back to original src:", e);
+      setWaveform(Array.from({ length: 60 }, () => Math.random() * 0.5 + 0.1));
+      
+      // Fallback to original src if fetch failed and it's not already a blob
+      if (!src.startsWith('blob:')) {
+        setCurrentSrc(src);
+      }
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const time = parseFloat(e.target.value);
-    if (audioRef.current) {
-      audioRef.current.currentTime = time;
-      setCurrentTime(time);
+  // Cleanup local URLs
+  useEffect(() => {
+    return () => {
+      if (currentSrc && currentSrc.startsWith('blob:') && currentSrc !== src) {
+        URL.revokeObjectURL(currentSrc);
+      }
+    };
+  }, [currentSrc, src]);
+
+  const togglePlay = async () => {
+    if (!audioRef.current || !currentSrc) return;
+    
+    if (audioRef.current.error) {
+      console.error("Audio element has error before play:", audioRef.current.error);
+      setError(`Playback failed: ${audioRef.current.error.message || 'Source not supported'}`);
+      return;
+    }
+
+    if (isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      try {
+        await audioRef.current.play();
+        setIsPlaying(true);
+        setError(null);
+      } catch (e) {
+        console.error("Playback failed:", e);
+        setError("Playback failed");
+      }
     }
   };
 
-  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const vol = parseFloat(e.target.value);
-    setVolume(vol);
-    if (audioRef.current) {
-      audioRef.current.volume = vol;
-      setIsMuted(vol === 0);
-    }
-  };
-
-  const toggleMute = () => {
-    if (audioRef.current) {
-      const newMuted = !isMuted;
-      setIsMuted(newMuted);
-      audioRef.current.muted = newMuted;
-    }
+  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!audioRef.current || !duration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const percentage = x / rect.width;
+    const time = percentage * duration;
+    audioRef.current.currentTime = time;
+    setCurrentTime(time);
   };
 
   const formatTime = (time: number) => {
-    if (isNaN(time)) return "0:00";
+    if (isNaN(time) || time === Infinity) return "0:00";
     const mins = Math.floor(time / 60);
     const secs = Math.floor(time % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   return (
-    <div className={`flex flex-col gap-2 min-w-[240px] p-2 rounded-none ${isSelf ? 'text-white' : 'text-zinc-900 dark:text-zinc-100'}`}>
+    <div className={`flex flex-col gap-2 min-w-[280px] p-2 ${isSelf ? 'text-white' : 'text-zinc-900 dark:text-zinc-100'}`}>
       <audio 
+        key={currentSrc || 'no-src'}
         ref={audioRef} 
-        key={src} 
-        src={src} 
         preload="metadata" 
-        crossOrigin="anonymous"
-      />
-      {error ? (
-        <div className="flex flex-col gap-2 p-3 bg-red-500/10 border border-red-500/20">
-          <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider">
-            <AlertTriangle size={14} className="text-red-500" />
-            <span className="flex-1 text-red-500">{error}</span>
+        className="hidden"
+      >
+        {currentSrc && <source src={currentSrc} />}
+      </audio>
+      
+      <div className="flex items-center gap-4">
+        <button 
+          onClick={togglePlay}
+          disabled={!currentSrc || isLoading}
+          className={`w-12 h-12 rounded-full flex items-center justify-center transition-all shadow-sm flex-shrink-0 disabled:opacity-50 ${isSelf ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500'}`}
+        >
+          {isLoading ? (
+            <Loader2 size={24} className="animate-spin" />
+          ) : isPlaying ? (
+            <Pause size={24} fill="currentColor" />
+          ) : (
+            <Play size={24} fill="currentColor" className="ml-1" />
+          )}
+        </button>
+        
+        <div className="flex-1 flex flex-col gap-1">
+          <div 
+            className="relative h-10 flex items-end gap-[2px] cursor-pointer group"
+            onClick={handleSeek}
+          >
+            {waveform.length > 0 ? (
+              waveform.map((val, i) => {
+                const progress = (currentTime / duration) || 0;
+                const isPlayed = (i / waveform.length) < progress;
+                return (
+                  <div 
+                    key={i}
+                    className={`flex-1 rounded-full transition-all duration-200 ${isPlayed ? (isSelf ? 'bg-white' : 'bg-emerald-500') : (isSelf ? 'bg-white/30' : 'bg-zinc-300 dark:bg-zinc-700')}`}
+                    style={{ height: `${Math.max(10, val * 100)}%` }}
+                  />
+                );
+              })
+            ) : (
+              <div className="w-full h-full flex items-center justify-center opacity-20">
+                <div className="flex gap-1">
+                  {[1,2,3,4,5].map(i => (
+                    <motion.div 
+                      key={i}
+                      animate={{ height: [8, 20, 8] }}
+                      transition={{ duration: 1, repeat: Infinity, delay: i * 0.1 }}
+                      className={`w-1 rounded-full ${isSelf ? 'bg-white' : 'bg-emerald-500'}`}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+            
+            {/* Hover indicator */}
+            <div className="absolute inset-0 opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity">
+              <div 
+                className={`absolute top-0 bottom-0 w-[1px] ${isSelf ? 'bg-white/50' : 'bg-emerald-500/50'}`}
+                style={{ left: `${(currentTime / duration) * 100}%` }}
+              />
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button 
-              onClick={() => { setError(null); audioRef.current?.load(); }}
-              className="flex-1 py-1.5 bg-red-500 text-white text-[9px] font-bold uppercase hover:bg-red-600 transition-colors"
-            >
-              Retry
-            </button>
-            <a 
-              href={src} 
-              download
-              className="flex-1 py-1.5 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 text-[9px] font-bold uppercase text-center hover:bg-zinc-300 dark:hover:bg-zinc-700 transition-colors"
-            >
-              Download
-            </a>
+          
+          <div className="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest opacity-60">
+            <span>{formatTime(currentTime)}</span>
+            <div className="flex items-center gap-2">
+              {error && <span className="text-red-500 lowercase font-normal">{error}</span>}
+              <span>{formatTime(duration)}</span>
+            </div>
           </div>
         </div>
-      ) : (
-        <>
-          <div className="flex items-center gap-3">
-            <button 
-              onClick={togglePlay}
-              className={`p-2 rounded-none transition-colors ${isSelf ? 'hover:bg-white/10' : 'hover:bg-zinc-200 dark:hover:bg-zinc-800'}`}
-            >
-              {isPlaying ? <Pause size={20} /> : <Play size={20} />}
-            </button>
-            
-            <div className="flex-1 flex flex-col gap-1">
-              <input 
-                type="range"
-                min="0"
-                max={duration || 0}
-                step="0.1"
-                value={currentTime}
-                onChange={handleSeek}
-                className={`w-full h-1 rounded-none appearance-none cursor-pointer ${isSelf ? 'bg-white/30 accent-white' : 'bg-zinc-300 dark:bg-zinc-700 accent-emerald-500'}`}
-              />
-              <div className="flex justify-between text-[10px] font-mono opacity-70">
-                <span>{formatTime(currentTime)}</span>
-                <span>{formatTime(duration)}</span>
-              </div>
-            </div>
 
-            <a 
-              href={src} 
-              download
-              className={`p-2 rounded-none transition-colors ${isSelf ? 'hover:bg-white/10' : 'hover:bg-zinc-200 dark:hover:bg-zinc-800'}`}
-              title="Download Audio"
-            >
-              <Download size={16} />
-            </a>
-          </div>
-
-          <div className="flex items-center gap-3 px-2">
-            <button onClick={toggleMute} className="opacity-70 hover:opacity-100 transition-opacity">
-              {isMuted || volume === 0 ? <VolumeX size={14} /> : volume < 0.5 ? <Volume1 size={14} /> : <Volume2 size={14} />}
-            </button>
-            <input 
-              type="range"
-              min="0"
-              max="1"
-              step="0.1"
-              value={isMuted ? 0 : volume}
-              onChange={handleVolumeChange}
-              className={`w-16 h-1 rounded-none appearance-none cursor-pointer ${isSelf ? 'bg-white/30 accent-white' : 'bg-zinc-300 dark:bg-zinc-700 accent-emerald-500'}`}
-            />
-          </div>
-        </>
-      )}
+        <a 
+          href={src} 
+          download={`voice-note-${Date.now()}.${mimeType?.split('/')[1]?.split(';')[0] || 'webm'}`}
+          className={`p-2 rounded-full transition-colors ${isSelf ? 'hover:bg-white/10 text-white/50 hover:text-white' : 'hover:bg-zinc-100 dark:hover:bg-zinc-900 text-zinc-400 hover:text-zinc-600'}`}
+          title="Download Audio"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <Download size={16} />
+        </a>
+      </div>
     </div>
   );
 };
@@ -336,6 +455,10 @@ const hexToBytes = (hex: string): Uint8Array => {
     bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
   }
   return bytes;
+};
+
+const bytesToHex = (bytes: Uint8Array): string => {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 };
 
 const formatNpub = (pubkey: string) => {
@@ -429,8 +552,19 @@ export default function App() {
   const [viewingProfile, setViewingProfile] = useState<any>(null);
   const [fontFamily, setFontFamily] = useState(() => localStorage.getItem('pam_font_family') || 'sans');
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('pam_notifications') === 'true');
+  const [sendDelayEnabled, setSendDelayEnabled] = useState(() => localStorage.getItem('pam_send_delay') === 'true');
+  const [pendingMessages, setPendingMessages] = useState<Record<string, { timeoutId: number; timeLeft: number; content: string; type: MessageType; duration?: number; mimeType?: string }>>({});
   const [bunkerUri, setBunkerUri] = useState('');
   const [showBunkerInput, setShowBunkerInput] = useState(false);
+  const [showBlossomMenu, setShowBlossomMenu] = useState(false);
+  const [bunkerSession, setBunkerSession] = useState<{ remotePubkey: string; localPrivkey: Uint8Array; relay: string } | null>(() => {
+    const saved = localStorage.getItem('pam_bunker_session');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return { ...parsed, localPrivkey: hexToBytes(parsed.localPrivkey) };
+    }
+    return null;
+  });
   const [userDmRelays, setUserDmRelays] = useState<string[]>(() => {
     const saved = localStorage.getItem('pam_dm_relays');
     return saved ? JSON.parse(saved) : DEFAULT_RELAYS;
@@ -535,6 +669,21 @@ export default function App() {
 
   // --- Effects ---
   useEffect(() => {
+    // Handle NIP-55 return values from URL
+    const url = new URL(window.location.href);
+    const urlPubKey = url.searchParams.get('pubKey') || url.searchParams.get('pubkey');
+    if (urlPubKey && !pubKey) {
+      setPubKey(urlPubKey);
+      setLoginMethod('nip55');
+      localStorage.setItem('pam_login_method', 'nip55');
+      localStorage.setItem('pam_pubkey', urlPubKey);
+      showToast("Logged in via Android Signer", "success");
+      // Clean up URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [pubKey]);
+
+  useEffect(() => {
     if (pubKey) {
       fetchProfile(pubKey);
       fetchBlossomServers(pubKey);
@@ -600,7 +749,7 @@ export default function App() {
   }, [pubKey]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // No longer scrolling to bottom as newest messages are at the top
   }, [messages]);
 
   useEffect(() => {
@@ -610,6 +759,13 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('pam_deleted_messages', JSON.stringify(Array.from(deletedMessageIds)));
   }, [deletedMessageIds]);
+
+  useEffect(() => {
+    if (!preferredBlossomServer && userBlossomServers.length > 0) {
+      setPreferredBlossomServer(userBlossomServers[0]);
+      localStorage.setItem('pam_preferred_blossom', userBlossomServers[0]);
+    }
+  }, [userBlossomServers, preferredBlossomServer]);
 
   // --- Logic ---
   const loadLocalData = async () => {
@@ -666,20 +822,45 @@ export default function App() {
     }
   };
 
+  const nip44Encrypt = async (otherPk: string, plaintext: string): Promise<string> => {
+    if (loginMethod === 'local' && privKey) {
+      return nip44.encrypt(plaintext, nip44.getConversationKey(privKey, otherPk));
+    }
+    if (loginMethod === 'nip07' && window.nostr?.nip44) {
+      return window.nostr.nip44.encrypt(otherPk, plaintext);
+    }
+    if (loginMethod === 'nip46' && bunkerSession) {
+      return await nip46Request('nip44_encrypt', [otherPk, plaintext]);
+    }
+    throw new Error("Encryption failed: No signer or NIP-44 support");
+  };
+
+  const nip44Decrypt = async (otherPk: string, ciphertext: string): Promise<string> => {
+    if (loginMethod === 'local' && privKey) {
+      return nip44.decrypt(ciphertext, nip44.getConversationKey(privKey, otherPk));
+    }
+    if (loginMethod === 'nip07' && window.nostr?.nip44) {
+      return window.nostr.nip44.decrypt(otherPk, ciphertext);
+    }
+    if (loginMethod === 'nip46' && bunkerSession) {
+      return await nip46Request('nip44_decrypt', [otherPk, ciphertext]);
+    }
+    throw new Error("Decryption failed: No signer or NIP-44 support");
+  };
+
   const decryptMessages = async () => {
-    if (!privKey || !pubKey) return;
+    if (!pubKey) return;
     setIsDecrypting(true);
     
     for (const event of pendingEncryptedEvents) {
       try {
-        const conversationKey = nip44.getConversationKey(privKey, event.pubkey);
-        const sealStr = nip44.decrypt(event.content, conversationKey);
+        const sealStr = await nip44Decrypt(event.pubkey, event.content);
         const seal = JSON.parse(sealStr);
         if (!verifyEvent(seal)) {
           console.error("Invalid Seal signature for event", event.id);
           continue;
         }
-        const rumorStr = nip44.decrypt(seal.content, nip44.getConversationKey(privKey, seal.pubkey));
+        const rumorStr = await nip44Decrypt(seal.pubkey, seal.content);
         const rumor = JSON.parse(rumorStr);
         
         if (rumor.kind === KIND_DM || rumor.kind === 1222) {
@@ -726,21 +907,20 @@ export default function App() {
   };
 
   const subscribeToMessages = () => {
-    if (!pubKey || !privKey) return;
+    if (!pubKey) return;
     const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
     const sub = pool.current.subscribeMany(relays, [
       { kinds: [KIND_GIFT_WRAP], '#p': [pubKey] }
     ], {
       onevent: async (event) => {
         try {
-          const conversationKey = nip44.getConversationKey(privKey, event.pubkey);
-          const sealStr = nip44.decrypt(event.content, conversationKey);
+          const sealStr = await nip44Decrypt(event.pubkey, event.content);
           const seal = JSON.parse(sealStr);
           if (!verifyEvent(seal)) {
             console.error("Invalid Seal signature for event", event.id);
             return;
           }
-          const rumorStr = nip44.decrypt(seal.content, nip44.getConversationKey(privKey, seal.pubkey));
+          const rumorStr = await nip44Decrypt(seal.pubkey, seal.content);
           const rumor = JSON.parse(rumorStr);
           if (rumor.kind === KIND_DM || rumor.kind === 1222) {
             const receiverTag = rumor.tags.find((t: any) => t[0] === 'p');
@@ -810,7 +990,58 @@ export default function App() {
   const signEvent = async (template: UnsignedEvent): Promise<Event> => {
     if (loginMethod === 'local' && privKey) return finalizeEvent(template, privKey);
     if (loginMethod === 'nip07' && window.nostr) return window.nostr.signEvent(template);
+    if (loginMethod === 'nip46' && bunkerSession) {
+      const response = await nip46Request('sign_event', [JSON.stringify(template)]);
+      return typeof response === 'string' ? JSON.parse(response) : response;
+    }
+    if (loginMethod === 'nip55') {
+      // NIP-55 Android Signer intent
+      const eventJson = JSON.stringify(template);
+      const intentUrl = `intent:#Intent;action=com.nostr.signer.SIGN_EVENT;S.event=${encodeURIComponent(eventJson)};S.pubKey=${pubKey};end`;
+      window.location.href = intentUrl;
+      // This is tricky on web as it's a redirect. Real NIP-55 on web usually relies on a bridge.
+      // For now we'll throw as we can't wait for the result easily without a bridge.
+      throw new Error("NIP-55 requires a compatible Android Nostr browser or bridge.");
+    }
     throw new Error("No signer");
+  };
+
+  const nip46Request = async (method: string, params: string[]): Promise<string> => {
+    if (!bunkerSession) throw new Error("No bunker session");
+    const { remotePubkey, localPrivkey, relay } = bunkerSession;
+    const id = Math.random().toString(36).substring(7);
+    const request = { id, method, params };
+    const encrypted = nip44.encrypt(JSON.stringify(request), nip44.getConversationKey(localPrivkey, remotePubkey));
+    
+    const event: UnsignedEvent = {
+      kind: 24133,
+      pubkey: getPublicKey(localPrivkey),
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['p', remotePubkey]],
+      content: encrypted
+    };
+    
+    const signed = finalizeEvent(event, localPrivkey);
+    await pool.current.publish([relay], signed);
+    
+    return new Promise((resolve, reject) => {
+      const sub = pool.current.subscribeMany([relay], [
+        { kinds: [24133], authors: [remotePubkey], '#p': [getPublicKey(localPrivkey)] }
+      ], {
+        onevent: (ev) => {
+          try {
+            const decrypted = nip44.decrypt(ev.content, nip44.getConversationKey(localPrivkey, remotePubkey));
+            const response = JSON.parse(decrypted);
+            if (response.id === id) {
+              sub.close();
+              if (response.error) reject(new Error(response.error));
+              else resolve(response.result);
+            }
+          } catch (e) {}
+        }
+      });
+      setTimeout(() => { sub.close(); reject(new Error("Request timed out")); }, 10000);
+    });
   };
 
   const validateDifficulty = (id: string, difficulty: number) => {
@@ -848,28 +1079,50 @@ export default function App() {
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     
-    let servers = [...new Set([...userBlossomServers])];
-    if (preferredBlossomServer && servers.includes(preferredBlossomServer)) {
-      servers = [preferredBlossomServer, ...servers.filter(s => s !== preferredBlossomServer)];
-    }
-    console.log(`Starting upload to Blossom servers: ${servers.join(', ')}`);
+    const getExtension = (mimeType: string) => {
+      const m = mimeType.toLowerCase();
+      if (m.includes('mp4')) return '.mp4';
+      if (m.includes('webm')) return '.webm';
+      if (m.includes('mpeg') || m.includes('mp3')) return '.mp3';
+      if (m.includes('ogg')) return '.ogg';
+      if (m.includes('wav')) return '.wav';
+      if (m.includes('aac')) return '.aac';
+      if (m.includes('jpeg') || m.includes('jpg')) return '.jpg';
+      if (m.includes('png')) return '.png';
+      if (m.includes('gif')) return '.gif';
+      return '';
+    };
+
+    const ext = getExtension(blob.type || '');
     
-    for (const server of servers) {
-      const normalizedServer = server.endsWith('/') ? server.slice(0, -1) : server;
+    const normalize = (s: string) => s.endsWith('/') ? s.slice(0, -1) : s;
+    let servers = [...new Set([...userBlossomServers.map(normalize)])];
+    if (preferredBlossomServer) {
+      const pref = normalize(preferredBlossomServer);
+      // Ensure the preferred server is at the very front
+      servers = [pref, ...servers.filter(s => s !== pref)];
+    }
+    console.log(`Blossom Upload: Prioritized server list:`, servers);
+    
+    for (const normalizedServer of servers) {
       try {
+        console.log(`Blossom Upload: Attempting ${normalizedServer}...`);
         // 1. Check if blob already exists
         try {
-          const checkResponse = await fetch(`${normalizedServer}/${hashHex}`, { method: 'HEAD' });
-          if (checkResponse.ok) {
-            console.log(`Blob already exists on ${normalizedServer}`);
-            return `${normalizedServer}/${hashHex}`;
+          // Try both with and without extension
+          const checkUrls = [`${normalizedServer}/${hashHex}`, `${normalizedServer}/${hashHex}${ext}`].filter(Boolean);
+          for (const checkUrl of checkUrls) {
+            const checkResponse = await fetch(checkUrl, { method: 'HEAD' });
+            if (checkResponse.ok) {
+              console.log(`Blossom Upload: Blob already exists on ${normalizedServer} at ${checkUrl}`);
+              return checkUrl;
+            }
           }
         } catch (e) {
-          // HEAD might fail due to CORS even if GET works, or server might not support it
-          console.log(`HEAD check failed for ${normalizedServer}, proceeding with upload attempt`);
+          console.log(`Blossom Upload: HEAD check failed for ${normalizedServer}, proceeding with upload attempt`);
         }
 
-        console.log(`Attempting upload to ${normalizedServer}...`);
+        console.log(`Blossom Upload: Attempting upload to ${normalizedServer}...`);
         
         const authEvent: UnsignedEvent = {
           kind: 24242,
@@ -906,12 +1159,17 @@ export default function App() {
           clearTimeout(timeoutId);
 
           if (response.ok) {
-            console.log(`Successfully uploaded to ${normalizedServer} via POST`);
+            console.log(`Blossom Upload: Successfully uploaded to ${normalizedServer} via POST`);
             const result = await response.json();
-            return result.url || `${normalizedServer}/${hashHex}`;
+            let finalUrl = result.url || `${normalizedServer}/${hashHex}`;
+            // Append extension if missing and we have one
+            if (ext && !finalUrl.toLowerCase().endsWith(ext)) {
+              finalUrl += ext;
+            }
+            return finalUrl;
           }
         } catch (postErr) {
-          console.warn(`POST to ${normalizedServer} failed:`, postErr);
+          console.warn(`Blossom Upload: POST to ${normalizedServer} failed:`, postErr);
         }
 
         // 2. Fallback to PUT if POST fails
@@ -919,7 +1177,7 @@ export default function App() {
           ...authEvent, 
           tags: [
             ...authEvent.tags.filter(t => t[0] !== 'u'), 
-            ['u', `${normalizedServer}/${hashHex}`]
+            ['u', `${normalizedServer}/${hashHex}${ext}`]
           ] 
         };
         const signedPutAuth = await signEvent(putAuthEvent);
@@ -929,7 +1187,7 @@ export default function App() {
         const putTimeoutId = setTimeout(() => putController.abort(), 30000);
 
         try {
-          const putResponse = await fetch(`${normalizedServer}/${hashHex}`, {
+          const putResponse = await fetch(`${normalizedServer}/${hashHex}${ext}`, {
             method: 'PUT',
             headers: {
               'Authorization': `Nostr ${putAuthHeader}`,
@@ -943,14 +1201,14 @@ export default function App() {
           clearTimeout(putTimeoutId);
 
           if (putResponse.ok) {
-            console.log(`Successfully uploaded to ${normalizedServer} via PUT`);
-            return `${normalizedServer}/${hashHex}`;
+            console.log(`Blossom Upload: Successfully uploaded to ${normalizedServer} via PUT`);
+            return `${normalizedServer}/${hashHex}${ext}`;
           }
         } catch (putErr) {
-          console.warn(`PUT to ${normalizedServer} failed:`, putErr);
+          console.warn(`Blossom Upload: PUT to ${normalizedServer} failed:`, putErr);
         }
       } catch (err) {
-        console.error(`Failed to upload to ${normalizedServer}:`, err);
+        console.error(`Blossom Upload: Failed to process ${normalizedServer}:`, err);
       }
     }
     
@@ -958,16 +1216,55 @@ export default function App() {
     throw new Error("Upload failed. Check your network or try adding a different media server in Settings.");
   };
 
-  const sendMessage = async (content = newMessage, type: MessageType = 'text', duration?: number, mimeType?: string) => {
-    if (!activeChat || !pubKey || !privKey) return;
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPendingMessages(prev => {
+        const next = { ...prev };
+        let changed = false;
+        Object.keys(next).forEach(id => {
+          if (next[id].timeLeft > 0) {
+            next[id] = { ...next[id], timeLeft: next[id].timeLeft - 1 };
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const cancelPendingMessage = (id: string) => {
+    setPendingMessages(prev => {
+      const msg = prev[id];
+      if (msg) {
+        clearTimeout(msg.timeoutId);
+        if (msg.type === 'text') setNewMessage(msg.content);
+      }
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  const performSendMessage = async (content: string, type: MessageType = 'text', duration?: number, mimeType?: string) => {
+    if (!activeChat || !pubKey || (!privKey && loginMethod === 'local')) return;
     const text = content.trim();
     if (!text && type === 'text') return;
     setIsMining(true);
     const tempId = Math.random().toString(36).substring(7);
-    const msg: Message = { id: tempId, sender: pubKey, receiver: activeChat, content: text, created_at: Math.floor(Date.now() / 1000), isSelf: true, type };
+    const msg: Message = { 
+      id: tempId, 
+      sender: pubKey, 
+      receiver: activeChat, 
+      content: text, 
+      created_at: Math.floor(Date.now() / 1000), 
+      isSelf: true, 
+      type,
+      duration,
+      mimeType
+    };
     
     // Check for NIP-44 size limit (65535 bytes)
-    // Rumor + Seal + Wrap overhead means we should stay well below 65k
     if (text.length > 60000) {
       alert("Message too large. Please send a shorter text.");
       setIsMining(false);
@@ -975,40 +1272,41 @@ export default function App() {
     }
 
     setMessages(prev => [...prev, msg]);
-    setNewMessage('');
     try {
       const rumorTemplate: UnsignedEvent = { 
-        kind: type === 'voice' ? 1222 : KIND_DM, 
+        kind: KIND_DM, 
         pubkey: pubKey, 
         created_at: msg.created_at, 
         tags: [['p', activeChat]], 
         content: text 
       };
-      if (type === 'image') rumorTemplate.tags.push(['t', 'image']);
+      if (type === 'image') {
+        rumorTemplate.tags.push(['t', 'image']);
+        if (mimeType) rumorTemplate.tags.push(['m', mimeType]);
+      }
       if (type === 'voice') {
         rumorTemplate.tags.push(['t', 'voice']);
         if (duration) rumorTemplate.tags.push(['duration', duration.toString()]);
         if (mimeType) rumorTemplate.tags.push(['m', mimeType]);
+        else rumorTemplate.tags.push(['m', 'audio/webm']); // Default fallback
       }
       const rumor = { ...rumorTemplate, id: getEventHash(rumorTemplate) };
       
       // 1. Create Seals (KIND 13)
-      // Seal for Receiver
       const sealForReceiverTemplate: UnsignedEvent = {
         kind: 13,
         pubkey: pubKey,
         created_at: Math.floor(Date.now() / 1000),
         tags: [],
-        content: nip44.encrypt(JSON.stringify(rumor), nip44.getConversationKey(privKey, activeChat))
+        content: await nip44Encrypt(activeChat, JSON.stringify(rumor))
       };
       const signedSealForReceiver = await signEvent(sealForReceiverTemplate);
 
       // 2. Create Gift Wraps (KIND 1059)
       const ephemeralPriv = generateSecretKey();
       const ephemeralPub = getPublicKey(ephemeralPriv);
-      const wrapCreatedAt = Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 60); // Slight randomization
+      const wrapCreatedAt = Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 60);
 
-      // Wrap for Receiver
       const wrapForReceiverTemplate: UnsignedEvent = {
         kind: KIND_GIFT_WRAP,
         pubkey: ephemeralPub,
@@ -1018,7 +1316,6 @@ export default function App() {
       };
       const signedWrapForReceiver = finalizeEvent(wrapForReceiverTemplate, ephemeralPriv);
 
-      // Wrap for Self (if not sending to self)
       let signedWrapForSelf: Event | null = null;
       if (activeChat !== pubKey) {
         const sealForSelfTemplate: UnsignedEvent = {
@@ -1026,7 +1323,7 @@ export default function App() {
           pubkey: pubKey,
           created_at: Math.floor(Date.now() / 1000),
           tags: [],
-          content: nip44.encrypt(JSON.stringify(rumor), nip44.getConversationKey(privKey, pubKey))
+          content: await nip44Encrypt(pubKey, JSON.stringify(rumor))
         };
         const signedSealForSelf = await signEvent(sealForSelfTemplate);
 
@@ -1040,7 +1337,6 @@ export default function App() {
         signedWrapForSelf = finalizeEvent(wrapForSelfTemplate, ephemeralPriv);
       }
       
-      // PoW Mining for Receiver's Wrap if difficulty > 0
       let finalWrapForReceiver = signedWrapForReceiver;
       if (powDifficulty > 0) {
         let nonce = 0;
@@ -1072,6 +1368,35 @@ export default function App() {
     } finally {
       setIsMining(false);
     }
+  };
+
+  const sendMessage = async (content = newMessage, type: MessageType = 'text', duration?: number, mimeType?: string) => {
+    if (!activeChat || !pubKey) return;
+    if (loginMethod === 'local' && !privKey) return;
+    const text = content.trim();
+    if (!text && type === 'text') return;
+
+    if (!sendDelayEnabled) {
+      setNewMessage('');
+      return performSendMessage(text, type, duration, mimeType);
+    }
+
+    const id = Math.random().toString(36).substring(7);
+    const timeoutId = window.setTimeout(() => {
+      performSendMessage(text, type, duration, mimeType);
+      setPendingMessages(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }, 10000);
+
+    setPendingMessages(prev => ({
+      ...prev,
+      [id]: { timeoutId, timeLeft: 10, content: text, type, duration, mimeType }
+    }));
+
+    setNewMessage('');
   };
 
   const loginLocal = (key: Uint8Array) => {
@@ -1136,38 +1461,41 @@ export default function App() {
   };
 
   const startRecording = async () => {
+    if (!preferredBlossomServer) {
+      showToast("Please select a Media Server first", "info");
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (stream.getAudioTracks().length === 0) {
         throw new Error("No audio tracks found in stream");
       }
       
-      // Find a supported mime type
       const mimeTypes = [
-        'audio/mp4',
-        'audio/aac',
         'audio/webm;codecs=opus',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
         'audio/webm',
-        'audio/ogg;codecs=opus'
+        'audio/ogg',
+        'audio/aac',
+        'audio/mpeg'
       ];
       const supportedType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || '';
       
       console.log(`Starting recording with mimeType: ${supportedType || 'default'}`);
       const options: MediaRecorderOptions = {
-        audioBitsPerSecond: 16000 // 16kbps is perfect for voice and fits NIP-44 limits
+        audioBitsPerSecond: 64000 // Lower bitrate for better compatibility
       };
       if (supportedType) options.mimeType = supportedType;
 
       const mediaRecorder = new MediaRecorder(stream, options);
       mediaRecorderRef.current = mediaRecorder;
-      const chunks: BlobPart[] = [];
+      const chunks: Blob[] = [];
 
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
           chunks.push(e.data);
           console.log(`Data available: ${e.data.size} bytes. Total chunks: ${chunks.length}`);
-        } else {
-          console.warn("Data available but size is 0");
         }
       };
 
@@ -1176,7 +1504,7 @@ export default function App() {
         setRecordingDuration(0);
         recordingIntervalRef.current = window.setInterval(() => {
           setRecordingDuration(prev => {
-            if (prev >= 20) {
+            if (prev >= 120) {
               stopRecording();
               return prev;
             }
@@ -1197,7 +1525,7 @@ export default function App() {
         
         if (blob.size === 0) {
           console.error("CRITICAL: Recording resulted in an empty blob!");
-          showToast("Recording failed: No audio data captured. Please check microphone permissions.", "error");
+          showToast("Recording failed: No audio data captured.", "error");
           setAudioBlob(null);
           setAudioUrl(null);
         } else {
@@ -1207,7 +1535,7 @@ export default function App() {
         stream.getTracks().forEach(track => track.stop());
       };
 
-      mediaRecorder.start(500); // Capture data every 500ms for better reliability
+      mediaRecorder.start(100); // Smaller timeslice for better reliability
     } catch (err) {
       console.error("Failed to start recording", err);
       showToast("Could not access microphone", "error");
@@ -1253,30 +1581,90 @@ export default function App() {
     if (!bunkerUri) return;
     try {
       setIsSyncing(true);
-      const remotePubkey = bunkerUri.split('@')[1]?.split('?')[0];
-      if (!remotePubkey) throw new Error("Invalid Bunker URI");
+      // Parse bunker URI: bunker://<pubkey>@<relay>?secret=<secret>
+      const url = new URL(bunkerUri.replace('bunker://', 'https://'));
+      const remotePubkey = url.username;
+      const relay = url.hostname;
+      const secret = url.searchParams.get('secret') || '';
       
-      // In a real app, we'd use nip46.NostrConnect to bridge
-      // For this demo, we'll simulate the pubkey acquisition
-      setPubKey(remotePubkey);
-      setLoginMethod('nip46');
-      localStorage.setItem('pam_login_method', 'nip46');
-      setShowBunkerInput(false);
-    } catch (err) {
-      alert("Bunker login failed");
+      if (!remotePubkey || !relay) throw new Error("Invalid Bunker URI");
+      
+      const localPrivkey = generateSecretKey();
+      const session = { remotePubkey, localPrivkey, relay };
+      setBunkerSession(session);
+      
+      // Send connect request
+      const id = Math.random().toString(36).substring(7);
+      const request = { id, method: 'connect', params: [getPublicKey(localPrivkey), secret] };
+      const encrypted = nip44.encrypt(JSON.stringify(request), nip44.getConversationKey(localPrivkey, remotePubkey));
+      
+      const event: UnsignedEvent = {
+        kind: 24133,
+        pubkey: getPublicKey(localPrivkey),
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['p', remotePubkey]],
+        content: encrypted
+      };
+      
+      const signed = finalizeEvent(event, localPrivkey);
+      await pool.current.publish([relay], signed);
+      
+      // Wait for response
+      const response = await new Promise<string>((resolve, reject) => {
+        const sub = pool.current.subscribeMany([relay], [
+          { kinds: [24133], authors: [remotePubkey], '#p': [getPublicKey(localPrivkey)] }
+        ], {
+          onevent: (ev) => {
+            try {
+              const decrypted = nip44.decrypt(ev.content, nip44.getConversationKey(localPrivkey, remotePubkey));
+              const resp = JSON.parse(decrypted);
+              if (resp.id === id) {
+                sub.close();
+                if (resp.error) reject(new Error(resp.error));
+                else resolve(resp.result);
+              }
+            } catch (e) {}
+          }
+        });
+        setTimeout(() => { sub.close(); reject(new Error("Connect timed out")); }, 15000);
+      });
+
+      if (response === 'ack' || response === remotePubkey) {
+        setPubKey(remotePubkey);
+        setLoginMethod('nip46');
+        localStorage.setItem('pam_login_method', 'nip46');
+        localStorage.setItem('pam_bunker_session', JSON.stringify({ 
+          remotePubkey, 
+          localPrivkey: bytesToHex(localPrivkey), 
+          relay 
+        }));
+        setShowBunkerInput(false);
+        showToast("Connected to Bunker", "success");
+      }
+    } catch (err: any) {
+      console.error("Bunker login failed", err);
+      alert(`Bunker login failed: ${err.message}`);
+      setBunkerSession(null);
     } finally {
       setIsSyncing(false);
     }
   };
 
   const loginNip55 = async () => {
-    // NIP-55 is Android Signer. On web, this often relies on a bridge or specific browser support.
-    // We'll attempt to use window.nostr as a fallback or proxy.
     if (window.nostr) {
       loginNip07();
-    } else {
-      alert("NIP-55 requires a compatible Android Nostr browser or bridge.");
+      return;
     }
+    
+    // NIP-55 Android Signer intent for get_public_key
+    // This is a one-way trip on web without a bridge.
+    // Some browsers like Amethyst/Amber support this via a bridge or by injecting window.nostr.
+    const intentUrl = `intent:#Intent;action=com.nostr.signer.GET_PUBLIC_KEY;S.callbackUrl=${encodeURIComponent(window.location.href)};end`;
+    window.location.href = intentUrl;
+    
+    // We can't easily handle the return on web without a specific route or hash listener.
+    // For now, we'll just inform the user.
+    showToast("Opening Android Signer...", "info");
   };
 
   const logout = () => {
@@ -1924,34 +2312,38 @@ export default function App() {
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-8">
-              {messages.filter(m => (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id)).map(msg => (
-                <div key={msg.id} className={`flex flex-col ${msg.isSelf ? 'items-end' : 'items-start'}`}>
-                  <div 
-                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed ${msg.isSelf ? 'bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white shadow-lg shadow-emerald-500/20' : 'bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 text-black dark:text-white border border-zinc-200 dark:border-zinc-800'}`}
-                  >
-                    {msg.type === 'image' ? (
-                      <div className="space-y-2">
-                        <img src={msg.content} alt="Shared image" className="max-w-full h-auto rounded-none border border-zinc-200 dark:border-zinc-800" referrerPolicy="no-referrer" />
-                        <a href={msg.content} target="_blank" rel="noopener noreferrer" className="text-[10px] underline opacity-50 hover:opacity-100 block">View original</a>
-                      </div>
-                    ) : msg.type === 'voice' ? (
-                      <AudioPlayer src={msg.content} isSelf={msg.isSelf} initialDuration={msg.duration} />
-                    ) : (
-                      msg.content
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2 mt-2 px-1">
-                    <span className="text-[9px] text-zinc-400 dark:text-zinc-600 uppercase font-bold tracking-wider">{formatDistanceToNow(msg.created_at * 1000)} ago</span>
-                    <button onClick={() => setDeletedMessageIds(prev => new Set(prev).add(msg.id))} className="text-[9px] text-zinc-300 dark:text-zinc-800 hover:text-red-500 transition-colors">Delete</button>
-                  </div>
-                </div>
-              ))}
-              <div ref={messagesEndRef} />
-            </div>
-
-            <div className="p-6 border-t border-zinc-200 dark:border-zinc-900 bg-white/50 dark:bg-black/50 backdrop-blur-md">
+            {/* Message Composer (Moved to Top) */}
+            <div className="p-6 border-b border-zinc-200 dark:border-zinc-900 bg-white dark:bg-black sticky top-0 z-30">
               <div className="max-w-4xl mx-auto space-y-4">
+                {Object.keys(pendingMessages).length > 0 && (
+                  <div className="space-y-2">
+                    {Object.keys(pendingMessages).map(id => {
+                      const msg = pendingMessages[id];
+                      return (
+                        <motion.div 
+                          key={id}
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.95 }}
+                          className="flex items-center justify-between p-3 bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800"
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="w-6 h-6 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">
+                              Sending in {msg.timeLeft}s...
+                            </span>
+                          </div>
+                          <button 
+                            onClick={() => cancelPendingMessage(id)}
+                            className="px-3 py-1 bg-red-500 text-white text-[9px] font-bold uppercase tracking-widest hover:bg-red-600 transition-colors"
+                          >
+                            Undo
+                          </button>
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                )}
                 <div className="flex items-center justify-between px-2">
                   <div className="flex items-center gap-2 text-[10px] text-zinc-400 dark:text-zinc-600 font-bold uppercase tracking-widest">
                     <Zap size={12} className={powDifficulty > 0 ? 'text-emerald-500' : ''} />
@@ -1968,7 +2360,7 @@ export default function App() {
                   {isRecording ? (
                     <div className="flex-1 flex items-center gap-4 px-6 py-4 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900 transition-all animate-pulse">
                       <div className="w-2 h-2 rounded-full bg-red-500" />
-                      <span className="flex-1 text-sm font-mono text-red-500 font-bold tracking-widest">{formatDuration(recordingDuration)} / 0:20</span>
+                      <span className="flex-1 text-sm font-mono text-red-500 font-bold tracking-widest">{formatDuration(recordingDuration)} / 2:00</span>
                       <button 
                         onClick={stopRecording}
                         className="p-2 text-red-500 hover:bg-red-500/10 transition-colors"
@@ -1980,7 +2372,7 @@ export default function App() {
                   ) : audioUrl ? (
                     <div className="flex-1 flex items-center gap-4 px-4 py-2 bg-zinc-50 dark:bg-zinc-950 border border-emerald-500/30">
                       <div className="flex-1">
-                        <AudioPlayer src={audioUrl} isSelf={false} />
+                        <AudioPlayer src={audioUrl} isSelf={true} initialDuration={recordingDuration} mimeType={audioBlob?.type} />
                       </div>
                       <button 
                         onClick={discardRecording}
@@ -2012,7 +2404,7 @@ export default function App() {
                       setIsUploading(true);
                       try {
                         const url = await uploadToBlossom(file);
-                        await sendMessage(url, 'image');
+                        await sendMessage(url, 'image', undefined, file.type);
                       } catch (err) {
                         alert("Failed to upload image: " + (err instanceof Error ? err.message : String(err)));
                       } finally {
@@ -2021,45 +2413,71 @@ export default function App() {
                     }}
                   />
 
-                  {!isRecording && !audioUrl && (
-                    <div className="relative group">
+                  {userBlossomServers.length > 0 && (
+                    <div className="relative z-50">
                       <button 
-                        onClick={() => document.getElementById('image-upload')?.click()} 
-                        className="p-4 bg-zinc-100 dark:bg-zinc-900 text-zinc-400 dark:text-zinc-500 rounded-none hover:text-emerald-500 transition-colors"
-                        title="Upload Image"
+                        onClick={() => setShowBlossomMenu(!showBlossomMenu)}
+                        className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${showBlossomMenu ? 'text-emerald-500' : 'text-zinc-400 dark:text-zinc-500 hover:text-emerald-500'}`}
+                        title="Media Server Settings"
                       >
-                        <ImageIcon size={20} />
+                        <HardDrive size={20} />
                       </button>
-                      {userBlossomServers.length > 1 && (
-                        <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-20">
-                          <div className="bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 shadow-xl p-2 min-w-[160px] space-y-1">
-                            <p className="text-[8px] font-bold text-zinc-400 uppercase tracking-widest px-2 pb-1 border-b border-zinc-100 dark:border-zinc-900">Upload Server</p>
-                            {userBlossomServers.map(server => (
-                              <button
-                                key={server}
-                                onClick={() => {
-                                  setPreferredBlossomServer(server);
-                                  localStorage.setItem('pam_preferred_blossom', server);
-                                }}
-                                className={`w-full text-left px-2 py-1.5 text-[9px] font-medium transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-900 flex items-center justify-between ${preferredBlossomServer === server ? 'text-emerald-500' : 'text-zinc-500'}`}
-                              >
-                                <span className="truncate max-w-[120px]">{server.replace('https://', '')}</span>
-                                {preferredBlossomServer === server && <Check size={10} />}
-                              </button>
-                            ))}
+                      {showBlossomMenu && (
+                        <>
+                          <div className="fixed inset-0 z-40" onClick={() => setShowBlossomMenu(false)} />
+                          <div className="absolute top-full left-0 mt-2 z-50">
+                            <div className="bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-2xl p-2 min-w-[200px] space-y-1">
+                              <p className="text-[8px] font-bold text-zinc-400 uppercase tracking-widest px-2 pb-1 border-b border-zinc-100 dark:border-zinc-900">Media Server</p>
+                              {userBlossomServers.map(server => {
+                                const isPreferred = preferredBlossomServer && 
+                                  (server.endsWith('/') ? server.slice(0, -1) : server) === 
+                                  (preferredBlossomServer.endsWith('/') ? preferredBlossomServer.slice(0, -1) : preferredBlossomServer);
+                                
+                                return (
+                                  <button
+                                    key={server}
+                                    onClick={() => {
+                                      setPreferredBlossomServer(server);
+                                      localStorage.setItem('pam_preferred_blossom', server);
+                                      setShowBlossomMenu(false);
+                                    }}
+                                    className={`w-full text-left px-2 py-1.5 text-[9px] font-medium transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-900 flex items-center justify-between ${isPreferred ? 'text-emerald-500' : 'text-zinc-500'}`}
+                                  >
+                                    <span className="truncate max-w-[140px]">{server.replace('https://', '')}</span>
+                                    {isPreferred && <Check size={10} />}
+                                  </button>
+                                );
+                              })}
+                            </div>
                           </div>
-                        </div>
+                        </>
                       )}
                     </div>
                   )}
 
                   {!isRecording && !audioUrl && (
                     <button 
-                      onClick={startRecording}
-                      className="p-4 bg-zinc-100 dark:bg-zinc-900 text-zinc-400 dark:text-zinc-500 rounded-none hover:text-red-500 transition-colors"
-                      title="Record Voice Message"
+                      onClick={() => {
+                        if (!preferredBlossomServer) {
+                          showToast("Please select a Media Server first", "info");
+                          return;
+                        }
+                        document.getElementById('image-upload')?.click();
+                      }} 
+                      className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${!preferredBlossomServer ? 'text-zinc-300 dark:text-zinc-800 cursor-not-allowed' : 'text-zinc-400 dark:text-zinc-500 hover:text-emerald-500'}`}
+                      title={preferredBlossomServer ? "Upload Image" : "Select a Media Server to upload"}
                     >
-                      <Mic size={20} />
+                      <ImageIcon size={20} className={!preferredBlossomServer ? 'opacity-50' : ''} />
+                    </button>
+                  )}
+
+                  {!isRecording && !audioUrl && (
+                    <button 
+                      onClick={startRecording}
+                      className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${!preferredBlossomServer ? 'text-zinc-300 dark:text-zinc-800 cursor-not-allowed' : 'text-zinc-400 dark:text-zinc-500 hover:text-red-500'}`}
+                      title={preferredBlossomServer ? "Record Voice Message" : "Select a Media Server to record"}
+                    >
+                      <Mic size={20} className={!preferredBlossomServer ? 'opacity-50' : ''} />
                     </button>
                   )}
 
@@ -2067,19 +2485,17 @@ export default function App() {
                     <button 
                       onClick={async () => {
                         if (audioUrl && audioBlob) {
+                          setIsUploading(true);
                           try {
-                            const base64 = await blobToBase64(audioBlob);
-                            // NIP-44 limit is 65535 bytes. Base64 adds ~33% overhead.
-                            // We should check the final string length.
-                            if (base64.length > 60000) {
-                              showToast("Voice note too long (max ~20s). Please record a shorter message.", "error");
-                              return;
-                            }
-                            await sendMessage(base64, 'voice', recordingDuration, audioBlob.type);
+                            // Upload to Blossom instead of sending base64 to avoid NIP-44 limits
+                            const url = await uploadToBlossom(audioBlob);
+                            await sendMessage(url, 'voice', recordingDuration, audioBlob.type);
                             discardRecording();
                           } catch (err) {
                             console.error("Failed to send voice message:", err);
-                            showToast("Failed to process voice message", "error");
+                            showToast("Failed to upload voice message", "error");
+                          } finally {
+                            setIsUploading(false);
                           }
                         } else {
                           sendMessage();
@@ -2093,6 +2509,34 @@ export default function App() {
                   )}
                 </div>
               </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-6 space-y-8 relative z-0">
+              {messages.filter(m => (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id))
+                .sort((a, b) => b.created_at - a.created_at)
+                .map(msg => (
+                <div key={msg.id} className={`flex flex-col ${msg.isSelf ? 'items-end' : 'items-start'}`}>
+                  <div 
+                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed ${msg.isSelf ? 'bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white shadow-lg shadow-emerald-500/20' : 'bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 text-black dark:text-white border border-zinc-200 dark:border-zinc-800'}`}
+                  >
+                    {msg.type === 'image' ? (
+                      <div className="space-y-2">
+                        <img src={msg.content} alt="Shared image" className="max-w-full h-auto rounded-none border border-zinc-200 dark:border-zinc-800" referrerPolicy="no-referrer" />
+                        <a href={msg.content} target="_blank" rel="noopener noreferrer" className="text-[10px] underline opacity-50 hover:opacity-100 block">View original</a>
+                      </div>
+                    ) : msg.type === 'voice' ? (
+                      <AudioPlayer src={msg.content} isSelf={msg.isSelf} initialDuration={msg.duration} mimeType={msg.mimeType} />
+                    ) : (
+                      msg.content
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 mt-2 px-1">
+                    <span className="text-[9px] text-zinc-400 dark:text-zinc-600 uppercase font-bold tracking-wider">{formatDistanceToNow(msg.created_at * 1000)} ago</span>
+                    <button onClick={() => setDeletedMessageIds(prev => new Set(prev).add(msg.id))} className="text-[9px] text-zinc-300 dark:text-zinc-800 hover:text-emerald-500 transition-colors">Hide</button>
+                  </div>
+                </div>
+              ))}
+              <div ref={messagesEndRef} />
             </div>
           </>
         )}
@@ -2516,7 +2960,25 @@ export default function App() {
                 </div>
 
                 <div className="space-y-4">
-                  <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Notifications</p>
+                  <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Preferences</p>
+                  
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-0.5">
+                      <p className="text-xs text-zinc-400">Send Delay (10s)</p>
+                      <p className="text-[8px] text-zinc-500 uppercase tracking-tighter">Undo window for sent messages</p>
+                    </div>
+                    <button 
+                      onClick={() => {
+                        const next = !sendDelayEnabled;
+                        setSendDelayEnabled(next);
+                        localStorage.setItem('pam_send_delay', String(next));
+                      }}
+                      className={`w-10 h-5 rounded-none transition-colors relative ${sendDelayEnabled ? 'bg-emerald-500' : 'bg-zinc-200 dark:bg-zinc-800'}`}
+                    >
+                      <div className={`absolute top-1 w-3 h-3 rounded-none transition-all ${sendDelayEnabled ? 'right-1 bg-white' : 'left-1 bg-zinc-400 dark:bg-zinc-600'}`} />
+                    </button>
+                  </div>
+
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-zinc-400">Enable Desktop Notifications</span>
                     <button 
