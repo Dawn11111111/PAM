@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   generateSecretKey, 
   getPublicKey, 
@@ -17,12 +17,16 @@ import {
   Settings, 
   Smartphone,
   Shield,
+  ShieldCheck,
+  ShieldAlert,
   AlertTriangle,
   Loader2,
   User,
   UserPlus,
   UserMinus,
+  UserCheck,
   Search,
+  Star,
   ArrowLeft,
   Trash2,
   RotateCcw,
@@ -38,6 +42,7 @@ import {
   LogOut,
   Sun,
   Moon,
+  Key,
   MessageSquare,
   Image as ImageIcon,
   Mic,
@@ -48,7 +53,9 @@ import {
   VolumeX,
   Volume1,
   HardDrive,
-  Download
+  Download,
+  CheckCircle,
+  Users
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { formatDistanceToNow } from 'date-fns';
@@ -73,7 +80,7 @@ declare global {
 
 // --- Types ---
 export type MessageType = 'text' | 'image' | 'voice';
-export type LoginMethod = 'local' | 'nip07' | 'nip46' | 'nip55';
+export type LoginMethod = 'local' | 'nip07' | 'nip46';
 
 export interface NostrProfile {
   name?: string;
@@ -103,9 +110,22 @@ export interface Conversation {
   profile?: NostrProfile;
 }
 
+export interface NostrTrustScore {
+  id: string;
+  pubkey: string;
+  content: string;
+  score: number;
+  created_at: number;
+}
+
 export interface Contact {
   pubkey: string;
   profile?: NostrProfile;
+  isWoT?: boolean;
+  isPriority?: boolean;
+  followedBy?: string[]; // Pubkeys of people who follow this person
+  trustScores?: NostrTrustScore[];
+  petname?: string; // NIP-02 petname
 }
 
 // --- Components ---
@@ -181,8 +201,9 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
     audio.addEventListener('error', onError);
 
     // Force load when currentSrc is set
-    // No longer needed as key={currentSrc} forces a fresh load on re-mount
-    // which is more reliable for clearing error states.
+    if (currentSrc && audio) {
+      audio.load();
+    }
 
     return () => {
       audio.removeEventListener('timeupdate', updateTime);
@@ -215,7 +236,6 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
       // We always create a new local URL for the fetched blob to ensure 
       // consistent playback and to avoid issues with original URLs.
       const localUrl = URL.createObjectURL(blob);
-      setCurrentSrc(localUrl);
 
       // 4. Generate Waveform
       const arrayBuffer = await blob.arrayBuffer();
@@ -243,6 +263,9 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
       } finally {
         await audioCtx.close();
       }
+
+      // 5. Set the local URL for playback after processing
+      setCurrentSrc(localUrl);
     } catch (e) {
       console.warn("Audio processing failed, falling back to original src:", e);
       setWaveform(Array.from({ length: 60 }, () => Math.random() * 0.5 + 0.1));
@@ -311,11 +334,10 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
       <audio 
         key={currentSrc || 'no-src'}
         ref={audioRef} 
+        src={currentSrc || undefined}
         preload="metadata" 
         className="hidden"
-      >
-        {currentSrc && <source src={currentSrc} />}
-      </audio>
+      />
       
       <div className="flex items-center gap-4">
         <button 
@@ -428,7 +450,41 @@ const INDEXER_RELAYS = ['wss://purplepag.es', 'wss://relay.nos.social'];
 const KIND_DM = 14;
 const KIND_SEAL = 13;
 const KIND_GIFT_WRAP = 1059;
+const KIND_REVIEW = 1985; // NIP-85 Label
 const KIND_BLOSSOM_LIST = 10063;
+
+const parseTrustScore = (event: Event): NostrTrustScore | null => {
+  // NIP-85 Label can use 'rating' tag or 'l' tag with 'trust' namespace
+  const ratingTag = event.tags.find(t => t[0] === 'rating');
+  const labelTag = event.tags.find(t => t[0] === 'l' && t[2] === 'trust');
+  
+  let score = 0;
+  if (ratingTag) {
+    score = parseFloat(ratingTag[1]);
+  } else if (labelTag) {
+    // Handle numeric labels or string labels like 'trusted'
+    const val = labelTag[1];
+    if (!isNaN(parseFloat(val))) {
+      score = parseFloat(val);
+    } else if (val === 'trusted') {
+      score = 1.0;
+    } else if (val === 'untrusted' || val === 'distrusted') {
+      score = 0.0;
+    }
+  } else {
+    // If no explicit score tag, but it's a Kind 1985 labeling a person, 
+    // we might treat it as a neutral or positive signal depending on content
+    return null;
+  }
+
+  return {
+    id: event.id,
+    pubkey: event.pubkey,
+    content: event.content,
+    score,
+    created_at: event.created_at
+  };
+};
 
 // --- Utilities ---
 const publishWithTimeout = async (pool: SimplePool, relays: string[], event: Event, timeout = 5000) => {
@@ -469,6 +525,14 @@ const formatNpub = (pubkey: string) => {
   }
 };
 
+const SEARCH_RELAYS = [
+  'wss://relay.nostr.band',
+  'wss://nos.lol',
+  'wss://relay.snort.social',
+  'wss://relay.damus.io',
+  'wss://purplerelay.com'
+];
+
 // --- Components ---
 
 const PamIcon = ({ className = "", size = 24 }: { className?: string, size?: number }) => {
@@ -487,6 +551,48 @@ const PamIcon = ({ className = "", size = 24 }: { className?: string, size?: num
       <circle cx="80" cy="20" r="4" fill="#10b981" />
       <circle cx="20" cy="80" r="4" fill="#3b82f6" />
     </svg>
+  );
+};
+
+const HexagonAvatar = ({ src, size = 40, className = "", onClick, fallback }: { src?: string, size?: number, className?: string, onClick?: () => void, fallback?: React.ReactNode }) => {
+  return (
+    <div 
+      onClick={onClick}
+      className={`relative hexagon bg-gradient-to-br from-emerald-500 to-blue-500 p-[1.5px] shrink-0 ${onClick ? 'cursor-pointer' : ''} ${className}`} 
+      style={{ width: size, height: size }}
+    >
+      <div className="w-full h-full hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden flex items-center justify-center">
+        {src ? (
+          <img src={src} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+        ) : (
+          fallback || <User size={size * 0.5} className="text-zinc-400 dark:text-zinc-600" />
+        )}
+      </div>
+    </div>
+  );
+};
+
+const ProfileBadges = ({ isFollowed, isPriority, isWoT, followedByCount, className = "" }: { isFollowed?: boolean, isPriority?: boolean, isWoT?: boolean, followedByCount?: number, className?: string }) => {
+  if (!isFollowed && !isPriority && !isWoT) return null;
+  
+  return (
+    <div className={`flex flex-wrap gap-1 shrink-0 items-center ${className}`}>
+      {isFollowed && (
+        <span className="px-1.5 py-0.5 bg-emerald-500 text-white text-[7px] font-black uppercase tracking-tighter flex items-center gap-0.5 rounded-none shadow-sm whitespace-nowrap">
+          <UserCheck size={8} strokeWidth={2.5} /> Followed
+        </span>
+      )}
+      {isPriority && (
+        <span className="px-1.5 py-0.5 bg-amber-500 text-white text-[7px] font-black uppercase tracking-tighter flex items-center gap-0.5 rounded-none shadow-sm whitespace-nowrap">
+          <ShieldCheck size={8} strokeWidth={2.5} /> Priority
+        </span>
+      )}
+      {isWoT && (
+        <span className="px-1.5 py-0.5 bg-blue-500 text-white text-[7px] font-black uppercase tracking-tighter flex items-center gap-0.5 rounded-none shadow-sm whitespace-nowrap">
+          <Users size={8} strokeWidth={2.5} /> WoT {followedByCount && followedByCount > 1 ? `(${followedByCount})` : ''}
+        </span>
+      )}
+    </div>
   );
 };
 
@@ -512,8 +618,36 @@ export default function App() {
   const [activeChat, setActiveChat] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<{pubkey: string, profile: NostrProfile}[]>([]);
+  const [searchResults, setSearchResults] = useState<Contact[]>([]);
+  const [priorityPubkeys, setPriorityPubkeys] = useState<string[]>(() => {
+    const saved = localStorage.getItem('pam_priority_pubkeys');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [wotPubkeys, setWotPubkeys] = useState<string[]>([]);
+  const [wotFollowMap, setWotFollowMap] = useState<Record<string, string[]>>({});
+
+  useEffect(() => {
+    const fetchWoT = async () => {
+      if (contacts.length > 0) {
+        const { secondDegree, followMap } = await getWoTPubkeys();
+        setWotPubkeys(secondDegree);
+        setWotFollowMap(followMap);
+      }
+    };
+    fetchWoT();
+  }, [contacts.length]);
+
+  const getDisplayName = (pk: string | null, profile?: NostrProfile) => {
+    if (!pk) return 'Anonymous';
+    const contact = contacts.find(c => c.pubkey === pk);
+    if (contact?.petname) return contact.petname;
+    return profile?.display_name || profile?.name || 'Anonymous';
+  };
+
   const [isSearching, setIsSearching] = useState(false);
+  const [petnameInput, setPetnameInput] = useState('');
+  const [isEditingPetname, setIsEditingPetname] = useState(false);
+
   const [newMessage, setNewMessage] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [showLogoutWarning, setShowLogoutWarning] = useState(false);
@@ -544,11 +678,19 @@ export default function App() {
   const [isMining, setIsMining] = useState(false);
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [showDecryptPrompt, setShowDecryptPrompt] = useState(false);
-  const [sidebarTab, setSidebarTab] = useState<'contacts' | 'conversations'>(() => (localStorage.getItem('pam_sidebar_tab') as any) || 'conversations');
+  const [sidebarTab, setSidebarTab] = useState<'contacts' | 'conversations' | 'priority'>(() => (localStorage.getItem('pam_sidebar_tab') as any) || 'conversations');
   const [pendingEncryptedEvents, setPendingEncryptedEvents] = useState<Event[]>([]);
   const [fontSize, setFontSize] = useState(() => Number(localStorage.getItem('pam_font_size')) || 14);
   const fontSizes = [12, 14, 16, 18];
   const [selectedProfile, setSelectedProfile] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (selectedProfile) {
+      const contact = contacts.find(c => c.pubkey === selectedProfile);
+      setPetnameInput(contact?.petname || '');
+      setIsEditingPetname(false);
+    }
+  }, [selectedProfile, contacts]);
   const [viewingProfile, setViewingProfile] = useState<any>(null);
   const [fontFamily, setFontFamily] = useState(() => localStorage.getItem('pam_font_family') || 'sans');
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('pam_notifications') === 'true');
@@ -646,6 +788,25 @@ export default function App() {
     showToast("Blossom servers saved", "success");
   };
 
+  const viewingTrustInfo = useMemo(() => {
+    if (!selectedProfile || contacts.length === 0) return { followedBy: [] };
+    
+    const searchRes = searchResults.find(r => r.pubkey === selectedProfile);
+    if (searchRes) {
+      return { 
+        followedBy: searchRes.followedBy || [] 
+      };
+    }
+    
+    return { followedBy: [] };
+  }, [selectedProfile, searchResults, contacts.length]);
+
+  const fetchTrustScores = useCallback(async (pk: string) => {
+    const relays = [...DEFAULT_RELAYS, ...SEARCH_RELAYS];
+    const events = await pool.current.querySync(relays, { kinds: [KIND_REVIEW], '#p': [pk] });
+    return events.map(parseTrustScore).filter((r): r is NostrTrustScore => r !== null);
+  }, []);
+
   const fetchProfile = useCallback(async (pk: string, force = false, customRelays?: string[]) => {
     if (!force) {
       const cached = await localDb.profiles.get(pk);
@@ -668,13 +829,27 @@ export default function App() {
   }, [pubKey, userDmRelays]);
 
   // --- Effects ---
+  const [viewingTrustScores, setViewingTrustScores] = useState<NostrTrustScore[]>([]);
+  const [showTrustScoreForm, setShowTrustScoreForm] = useState(false);
+  const [trustScoreValue, setTrustScoreValue] = useState(1.0);
+  const [trustScoreContext, setTrustScoreContext] = useState('');
+
+  useEffect(() => {
+    if (selectedProfile) {
+      fetchTrustScores(selectedProfile).then(setViewingTrustScores);
+    } else {
+      setViewingTrustScores([]);
+    }
+  }, [selectedProfile, fetchTrustScores]);
+
   useEffect(() => {
     // Handle NIP-55 return values from URL
     const url = new URL(window.location.href);
     const urlPubKey = url.searchParams.get('pubKey') || url.searchParams.get('pubkey');
     if (urlPubKey && !pubKey) {
       setPubKey(urlPubKey);
-      setLoginMethod('nip55');
+      // NIP-55 is no longer supported in login UI
+      // setLoginMethod('nip55');
       localStorage.setItem('pam_login_method', 'nip55');
       localStorage.setItem('pam_pubkey', urlPubKey);
       showToast("Logged in via Android Signer", "success");
@@ -793,19 +968,25 @@ export default function App() {
 
       // 2. Import Contacts (KIND 3)
       const contactEvent = await pool.current.get(searchRelays, { kinds: [3], authors: [pubKey] });
+
       if (contactEvent) {
-        const follows = contactEvent.tags.filter(t => t[0] === 'p').map(t => t[1]);
-        const contactList: Contact[] = follows.map(pk => ({ pubkey: pk }));
+        const contactList: Contact[] = contactEvent.tags
+          .filter(t => t[0] === 'p')
+          .map(t => ({
+            pubkey: t[1],
+            petname: t[3] || undefined
+          }));
         setContacts(contactList);
         
         // Pre-fetch profiles for follows using discovered relays
-        follows.forEach(async (pk) => {
-          const p = await fetchProfile(pk, searchRelays);
+        contactList.forEach(async (contact) => {
+          const p = await fetchProfile(contact.pubkey, searchRelays);
           if (p) {
-            setContacts(prev => prev.map(c => c.pubkey === pk ? { ...c, profile: p } : c));
+            setContacts(prev => prev.map(c => c.pubkey === contact.pubkey ? { ...c, profile: p } : c));
           }
         });
       }
+
 
       // 3. Fetch Gift Wraps (KIND 1059)
       const events = await pool.current.querySync(searchRelays, { kinds: [KIND_GIFT_WRAP], '#p': [pubKey], limit: 100 });
@@ -836,16 +1017,21 @@ export default function App() {
   };
 
   const nip44Decrypt = async (otherPk: string, ciphertext: string): Promise<string> => {
+    let result: any;
     if (loginMethod === 'local' && privKey) {
-      return nip44.decrypt(ciphertext, nip44.getConversationKey(privKey, otherPk));
+      result = nip44.decrypt(ciphertext, nip44.getConversationKey(privKey, otherPk));
+    } else if (loginMethod === 'nip07' && window.nostr?.nip44) {
+      result = await window.nostr.nip44.decrypt(otherPk, ciphertext);
+    } else if (loginMethod === 'nip46' && bunkerSession) {
+      result = await nip46Request('nip44_decrypt', [otherPk, ciphertext]);
+    } else {
+      throw new Error("Decryption failed: No signer or NIP-44 support");
     }
-    if (loginMethod === 'nip07' && window.nostr?.nip44) {
-      return window.nostr.nip44.decrypt(otherPk, ciphertext);
+
+    if (result === undefined || result === null || result === "undefined") {
+      throw new Error("Decryption returned empty or invalid result");
     }
-    if (loginMethod === 'nip46' && bunkerSession) {
-      return await nip46Request('nip44_decrypt', [otherPk, ciphertext]);
-    }
-    throw new Error("Decryption failed: No signer or NIP-44 support");
+    return result as string;
   };
 
   const decryptMessages = async () => {
@@ -853,15 +1039,24 @@ export default function App() {
     setIsDecrypting(true);
     
     for (const event of pendingEncryptedEvents) {
+      if (!event.content) continue;
       try {
         const sealStr = await nip44Decrypt(event.pubkey, event.content);
         const seal = JSON.parse(sealStr);
+        if (!seal.pubkey || !seal.content) {
+          console.warn("Invalid Seal structure for event", event.id);
+          continue;
+        }
         if (!verifyEvent(seal)) {
-          console.error("Invalid Seal signature for event", event.id);
+          console.warn("Invalid Seal signature for event", event.id);
           continue;
         }
         const rumorStr = await nip44Decrypt(seal.pubkey, seal.content);
         const rumor = JSON.parse(rumorStr);
+        if (!rumor || !rumor.kind) {
+          console.warn("Invalid Rumor structure for event", event.id);
+          continue;
+        }
         
         if (rumor.kind === KIND_DM || rumor.kind === 1222) {
           const receiverTag = rumor.tags.find((t: any) => t[0] === 'p');
@@ -892,8 +1087,8 @@ export default function App() {
           });
         }
       } catch (e: any) {
-        if (e.message?.includes('invalid MAC')) {
-          console.warn("Decryption failed (invalid MAC) for event", event.id, "- likely not for this key or corrupted.");
+        if (e.message?.includes('invalid MAC') || e.message?.includes('empty or invalid result')) {
+          console.warn("Decryption failed for event", event.id, "-", e.message, "- likely not for this key or corrupted.");
         } else {
           console.error("Decryption failed for event", event.id, e);
         }
@@ -913,15 +1108,24 @@ export default function App() {
       { kinds: [KIND_GIFT_WRAP], '#p': [pubKey] }
     ], {
       onevent: async (event) => {
+        if (!event.content) return;
         try {
           const sealStr = await nip44Decrypt(event.pubkey, event.content);
           const seal = JSON.parse(sealStr);
+          if (!seal.pubkey || !seal.content) {
+            console.warn("Invalid Seal structure for event", event.id);
+            return;
+          }
           if (!verifyEvent(seal)) {
-            console.error("Invalid Seal signature for event", event.id);
+            console.warn("Invalid Seal signature for event", event.id);
             return;
           }
           const rumorStr = await nip44Decrypt(seal.pubkey, seal.content);
           const rumor = JSON.parse(rumorStr);
+          if (!rumor || !rumor.kind) {
+            console.warn("Invalid Rumor structure for event", event.id);
+            return;
+          }
           if (rumor.kind === KIND_DM || rumor.kind === 1222) {
             const receiverTag = rumor.tags.find((t: any) => t[0] === 'p');
             const receiver = receiverTag ? receiverTag[1] : pubKey;
@@ -959,8 +1163,8 @@ export default function App() {
             });
           }
         } catch (e: any) {
-          if (e.message?.includes('invalid MAC')) {
-            console.warn("Decryption failed (invalid MAC) for event", event.id, "- likely not for this key or corrupted.");
+          if (e.message?.includes('invalid MAC') || e.message?.includes('empty or invalid result')) {
+            console.warn("Decryption failed for event", event.id, "-", e.message, "- likely not for this key or corrupted.");
           } else {
             console.error("Decryption failed for event", event.id, e);
           }
@@ -1035,6 +1239,7 @@ export default function App() {
             if (response.id === id) {
               sub.close();
               if (response.error) reject(new Error(response.error));
+              else if (response.result === undefined || response.result === null) reject(new Error("NIP-46 response result is empty"));
               else resolve(response.result);
             }
           } catch (e) {}
@@ -1650,26 +1855,61 @@ export default function App() {
     }
   };
 
-  const loginNip55 = async () => {
-    if (window.nostr) {
-      loginNip07();
-      return;
-    }
-    
-    // NIP-55 Android Signer intent for get_public_key
-    // This is a one-way trip on web without a bridge.
-    // Some browsers like Amethyst/Amber support this via a bridge or by injecting window.nostr.
-    const intentUrl = `intent:#Intent;action=com.nostr.signer.GET_PUBLIC_KEY;S.callbackUrl=${encodeURIComponent(window.location.href)};end`;
-    window.location.href = intentUrl;
-    
-    // We can't easily handle the return on web without a specific route or hash listener.
-    // For now, we'll just inform the user.
-    showToast("Opening Android Signer...", "info");
-  };
-
   const logout = () => {
     localStorage.clear();
     localDb.delete().then(() => window.location.reload());
+  };
+
+  const togglePriority = (targetPk: string) => {
+    const isPriority = priorityPubkeys.includes(targetPk);
+    const newPriority = isPriority 
+      ? priorityPubkeys.filter(pk => pk !== targetPk)
+      : [...priorityPubkeys, targetPk];
+    
+    setPriorityPubkeys(newPriority);
+    localStorage.setItem('pam_priority_pubkeys', JSON.stringify(newPriority));
+    
+    setSearchResults(prev => prev.map(res => 
+      res.pubkey === targetPk ? { ...res, isPriority: !isPriority } : res
+    ));
+  };
+
+  const updatePetname = async (pk: string, petname: string) => {
+    if (!pubKey) return;
+    
+    // If not following, this will follow them with a petname
+    const isFollowing = contacts.some(c => c.pubkey === pk);
+    let newContacts: Contact[];
+    
+    if (isFollowing) {
+      newContacts = contacts.map(c => c.pubkey === pk ? { ...c, petname } : c);
+    } else {
+      const p = await fetchProfile(pk);
+      newContacts = [...contacts, { pubkey: pk, profile: p || undefined, petname }];
+    }
+    
+    setContacts(newContacts);
+    showToast("Petname updated", "success");
+    
+    // NIP-02: ["p", <pubkey>, <relay-url>, <petname>]
+    const tags = newContacts.map(c => ['p', c.pubkey, '', c.petname || '']);
+    const event = {
+      kind: 3,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: '',
+      pubkey: pubKey
+    };
+    
+    const relays = userDmRelays.length > 0 ? [...new Set([...DEFAULT_RELAYS, ...userDmRelays])] : DEFAULT_RELAYS;
+    try {
+      const signedEvent = await signEvent(event);
+      if (signedEvent) {
+        await publishWithTimeout(pool.current, relays, signedEvent);
+      }
+    } catch (err) {
+      console.error('Failed to update petname:', err);
+    }
   };
 
   const toggleFollow = async (pk: string) => {
@@ -1685,9 +1925,12 @@ export default function App() {
     }
     
     setContacts(newContacts);
+    setSearchResults(prev => prev.map(res => 
+      res.pubkey === pk ? { ...res, isWoT: !isFollowing } : res
+    ));
     showToast(isFollowing ? "Unfollowed" : "Followed", "success");
     
-    const tags = newContacts.map(c => ['p', c.pubkey]);
+    const tags = newContacts.map(c => ['p', c.pubkey, '', c.petname || '']);
     const event = {
       kind: 3,
       created_at: Math.floor(Date.now() / 1000),
@@ -1708,6 +1951,34 @@ export default function App() {
   };
 
   const [showClearConfirm, setShowClearConfirm] = useState<string | null>(null);
+
+  const submitTrustScore = async () => {
+    if (!selectedProfile || !trustScoreContext.trim()) return;
+    
+    const event: UnsignedEvent = {
+      kind: KIND_REVIEW,
+      pubkey: pubKey!,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ['p', selectedProfile],
+        ['l', trustScoreValue.toString(), 'trust'],
+        ['rating', trustScoreValue.toString()] // Keep rating for compatibility
+      ],
+      content: trustScoreContext.trim()
+    };
+    
+    const signed = await signEvent(event);
+    if (signed) {
+      const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
+      await publishWithTimeout(pool.current, relays, signed);
+      showToast("Trust score published", "success");
+      setShowTrustScoreForm(false);
+      setTrustScoreContext('');
+      setTrustScoreValue(1.0);
+      // Refresh scores
+      fetchTrustScores(selectedProfile).then(setViewingTrustScores);
+    }
+  };
 
   const clearConversation = async (pk: string) => {
     try {
@@ -1794,188 +2065,267 @@ export default function App() {
     }
   };
 
-  const searchOnRelays = async (relays: string[], query: string): Promise<Contact[]> => {
+  const searchOnRelays = async (relays: string[], query: string, limit = 10): Promise<Contact[]> => {
     try {
       // NIP-50 search filter
       const events = await pool.current.querySync(relays, { 
         kinds: [0], 
         search: query, 
-        limit: 10 
+        limit 
       });
-      return events.map(ev => {
+      
+      const results: Contact[] = [];
+      const seen = new Set<string>();
+
+      events.forEach(ev => {
+        if (seen.has(ev.pubkey)) return;
+        seen.add(ev.pubkey);
         try {
-          return { pubkey: ev.pubkey, profile: JSON.parse(ev.content) };
+          const profile = JSON.parse(ev.content);
+          results.push({ 
+            pubkey: ev.pubkey, 
+            profile,
+            isWoT: wotPubkeys.includes(ev.pubkey),
+            followedBy: wotFollowMap[ev.pubkey],
+            isPriority: priorityPubkeys.includes(ev.pubkey)
+          });
         } catch {
-          return { pubkey: ev.pubkey };
+          results.push({ 
+            pubkey: ev.pubkey,
+            isWoT: wotPubkeys.includes(ev.pubkey),
+            followedBy: wotFollowMap[ev.pubkey],
+            isPriority: priorityPubkeys.includes(ev.pubkey)
+          });
         }
       });
+      return results;
     } catch (e) {
-      console.warn("Search filter not supported or failed on these relays", e);
+      console.warn("Search filter failed or not supported", e);
       return [];
     }
   };
 
-  const getSecondDegreePubkeys = async () => {
+  const getWoTPubkeys = async () => {
     const directFollows = contacts.map(c => c.pubkey);
-    if (directFollows.length === 0) return [];
+    if (directFollows.length === 0) return { secondDegree: [], followMap: {} };
     
     try {
       const searchRelays = userDmRelays.length > 0 ? [...new Set([...DEFAULT_RELAYS, ...userDmRelays])] : DEFAULT_RELAYS;
       // Fetch Kind 3 (Contact Lists) for direct follows
-      const contactEvents = await pool.current.querySync(searchRelays, { kinds: [3], authors: directFollows });
+      const wotEvents = await pool.current.querySync(searchRelays, { 
+        kinds: [3], 
+        authors: directFollows 
+      });
+      
       const secondDegree = new Set<string>();
-      contactEvents.forEach(ev => {
+      const followMap: Record<string, string[]> = {};
+      
+      wotEvents.forEach(ev => {
         ev.tags.forEach(tag => {
-          if (tag[0] === 'p') secondDegree.add(tag[1]);
+          if (tag[0] === 'p') {
+            const targetPk = tag[1];
+            secondDegree.add(targetPk);
+            if (!followMap[targetPk]) followMap[targetPk] = [];
+            if (!followMap[targetPk].includes(ev.pubkey)) followMap[targetPk].push(ev.pubkey);
+          }
         });
       });
-      // Remove direct follows and self to keep it strictly 2nd degree
-      directFollows.forEach(pk => secondDegree.delete(pk));
-      if (pubKey) secondDegree.delete(pubKey);
-      return Array.from(secondDegree);
+      
+      // Remove direct follows and self
+      directFollows.forEach(pk => {
+        secondDegree.delete(pk);
+      });
+      if (pubKey) {
+        secondDegree.delete(pubKey);
+      }
+      
+      return { 
+        secondDegree: Array.from(secondDegree), 
+        followMap
+      };
     } catch (e) {
-      console.error("Failed to fetch second degree pubkeys", e);
-      return [];
+      console.error("Failed to fetch WoT pubkeys", e);
+      return { secondDegree: [], followMap: {} };
     }
+  };
+
+  const scoreProfile = (contact: Contact): number => {
+    let score = 0;
+    
+    // NIP-02 Petname is the strongest local signal
+    if (contact.petname) score += 200;
+
+    if (!contact.profile) return score - 10;
+    
+    // NIP-05 verification is a strong signal
+    if (contact.profile.nip05) {
+      score += 50;
+      if (contact.profile.nip05.endsWith('@npub.world') || contact.profile.nip05.endsWith('@nostr.com')) {
+        score += 20; // Prioritize well-known providers
+      }
+    }
+    
+    // Metadata completeness
+    if (contact.profile.picture) score += 10;
+    if (contact.profile.display_name || contact.profile.name) score += 10;
+    if (contact.profile.about) score += 5;
+    
+    // WoT signal (if we have it)
+    if (contacts.some(c => c.pubkey === contact.pubkey)) score += 100; // Already a contact
+    if (contact.isPriority) score += 50; // User's local priority
+    if (contact.isWoT) score += 20; // Followed by network
+    
+    // Bonus for multiple follow signals
+    if (contact.followedBy && contact.followedBy.length > 1) score += contact.followedBy.length * 2;
+    
+    // NIP-85 Trust Scores signal
+    if (contact.trustScores && contact.trustScores.length > 0) {
+      score += contact.trustScores.length * 10;
+      const avgScore = contact.trustScores.reduce((acc, r) => acc + r.score, 0) / contact.trustScores.length;
+      if (avgScore > 0.8) score += 30;
+      else if (avgScore > 0.5) score += 15;
+    }
+    
+    return score;
   };
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
     setIsSyncing(true);
+    setSearchResults([]);
+    
     try {
       const query = searchQuery.trim();
+      const queryLower = query.toLowerCase();
       const isNip05 = query.includes('@');
       
-      // 1. Look in local contact list first for matching NIP-05 (including partial), name, or pubkey
-      const queryLower = query.toLowerCase();
-      const localMatches = contacts.filter(c => {
-        const name = (c.profile?.display_name || c.profile?.name || '').toLowerCase();
-        const nip05Val = (c.profile?.nip05 || '').toLowerCase();
-        const pk = c.pubkey.toLowerCase();
-        const npub = formatNpub(c.pubkey).toLowerCase();
-        
-        return name.includes(queryLower) || 
-               nip05Val.includes(queryLower) || 
-               pk === queryLower || 
-               npub === queryLower;
-      });
-
-      if (localMatches.length > 0) {
-        setSearchResults(localMatches);
-        setIsSyncing(false);
-        return;
-      }
-
-      // Prepare primary search relays
-      const searchRelays = userDmRelays.length > 0 ? [...new Set([...DEFAULT_RELAYS, ...userDmRelays])] : DEFAULT_RELAYS;
-      let targetPk = query;
-      let isResolvedPubkey = false;
-
+      // 1. Resolve NIP-05 or npub immediately
+      let targetPk: string | null = null;
       if (isNip05) {
-        const profile = await nip05.queryProfile(query);
-        if (profile) {
-          targetPk = profile.pubkey;
-          isResolvedPubkey = true;
-        }
+        try {
+          const profile = await nip05.queryProfile(query);
+          if (profile) targetPk = profile.pubkey;
+        } catch (e) { console.warn("NIP-05 resolution failed", e); }
       } else if (query.startsWith('npub1')) {
         try {
           const decoded = nip19.decode(query) as any;
-          if (decoded.type === 'npub') {
-            targetPk = decoded.data;
-            isResolvedPubkey = true;
-          }
+          if (decoded.type === 'npub') targetPk = decoded.data;
         } catch (e) {}
       } else if (query.length === 64 && /^[0-9a-f]+$/.test(query)) {
-        isResolvedPubkey = true;
+        targetPk = query;
       }
 
-      // 2. Search on primary relays (Write relays + Default)
-      if (isResolvedPubkey) {
-        const p = await fetchProfile(targetPk, false, searchRelays);
+      if (targetPk) {
+        const p = await fetchProfile(targetPk, false, [...DEFAULT_RELAYS, ...SEARCH_RELAYS]);
+        const r = await fetchTrustScores(targetPk);
         if (p) {
-          setSearchResults([{ pubkey: targetPk, profile: p }]);
-          setIsSyncing(false);
-          return;
-        }
-      } else {
-        // Keyword search on primary relays
-        const results = await searchOnRelays(searchRelays, query);
-        if (results.length > 0) {
-          setSearchResults(results);
+          setSearchResults([{ pubkey: targetPk, profile: p, trustScores: r }]);
           setIsSyncing(false);
           return;
         }
       }
 
-      // 3. Follows of Follows Search (2nd degree)
-      const secondDegreePubkeys = await getSecondDegreePubkeys();
-      if (secondDegreePubkeys.length > 0) {
-        if (isResolvedPubkey) {
-          if (secondDegreePubkeys.includes(targetPk)) {
-            const p = await fetchProfile(targetPk, false, searchRelays);
-            if (p) {
-              setSearchResults([{ pubkey: targetPk, profile: p }]);
-              setIsSyncing(false);
-              return;
-            }
-          }
-        } else {
-          // For keyword search, we check if any 2nd degree connection matches
-          // We fetch metadata for 2nd degree connections in batches (limited to avoid overhead)
-          const batchSize = 50;
-          const batches = [];
-          for (let i = 0; i < Math.min(secondDegreePubkeys.length, 200); i += batchSize) {
-            batches.push(secondDegreePubkeys.slice(i, i + batchSize));
-          }
+      // 2. Comprehensive Search: Local Contacts + WoT
+      const allMatches: Contact[] = [];
+      const seenPubkeys = new Set<string>();
 
-          for (const batch of batches) {
-            const events = await pool.current.querySync(searchRelays, { kinds: [0], authors: batch });
-            const matches = events.filter(ev => {
-              try {
-                const p = JSON.parse(ev.content);
-                const name = (p.display_name || p.name || '').toLowerCase();
-                const nip05Val = (p.nip05 || '').toLowerCase();
-                return name.includes(queryLower) || nip05Val.includes(queryLower);
-              } catch { return false; }
-            }).map(ev => {
-              try {
-                return { pubkey: ev.pubkey, profile: JSON.parse(ev.content) };
-              } catch {
-                return { pubkey: ev.pubkey };
+      // Add local matches
+      contacts.forEach(c => {
+        const name = (c.profile?.display_name || c.profile?.name || '').toLowerCase();
+        const petname = (c.petname || '').toLowerCase();
+        const nip05Val = (c.profile?.nip05 || '').toLowerCase();
+        if (name.includes(queryLower) || petname.includes(queryLower) || nip05Val.includes(queryLower)) {
+          allMatches.push({ ...c, isWoT: wotPubkeys.includes(c.pubkey), followedBy: wotFollowMap[c.pubkey] });
+          seenPubkeys.add(c.pubkey);
+        }
+      });
+
+      // 3. WoT Search (Degrees of Separation)
+      const { secondDegree: secondDegreePubkeys, followMap: currentFollowMap } = await getWoTPubkeys();
+      setWotPubkeys(secondDegreePubkeys);
+      setWotFollowMap(currentFollowMap);
+      
+      const combinedWoT = secondDegreePubkeys.filter(pk => !seenPubkeys.has(pk));
+      
+      if (combinedWoT.length > 0) {
+        const batchSize = 50;
+        const limit = 200;
+        
+        for (let i = 0; i < Math.min(combinedWoT.length, limit); i += batchSize) {
+          const batch = combinedWoT.slice(i, i + batchSize);
+          const [events, reviewsEvents] = await Promise.all([
+            pool.current.querySync(DEFAULT_RELAYS, { kinds: [0], authors: batch }),
+            pool.current.querySync(DEFAULT_RELAYS, { kinds: [KIND_REVIEW], '#p': batch })
+          ]);
+          
+          const localTrustScoresMap: Record<string, NostrTrustScore[]> = {};
+          reviewsEvents.forEach(ev => {
+            const pTag = ev.tags.find(t => t[0] === 'p');
+            if (pTag) {
+              const target = pTag[1];
+              if (!localTrustScoresMap[target]) localTrustScoresMap[target] = [];
+              const r = parseTrustScore(ev);
+              if (r) localTrustScoresMap[target].push(r);
+            }
+          });
+          
+          events.forEach(ev => {
+            if (seenPubkeys.has(ev.pubkey)) return;
+            try {
+              const p = JSON.parse(ev.content);
+              const name = (p.display_name || p.name || '').toLowerCase();
+              const nip05Val = (p.nip05 || '').toLowerCase();
+              if (name.includes(queryLower) || nip05Val.includes(queryLower)) {
+                allMatches.push({ 
+                  pubkey: ev.pubkey, 
+                  profile: p, 
+                  isWoT: true,
+                  isPriority: priorityPubkeys.includes(ev.pubkey),
+                  followedBy: currentFollowMap[ev.pubkey],
+                  trustScores: localTrustScoresMap[ev.pubkey] || []
+                });
+                seenPubkeys.add(ev.pubkey);
               }
-            });
-
-            if (matches.length > 0) {
-              setSearchResults(matches);
-              setIsSyncing(false);
-              return;
-            }
-          }
+            } catch {}
+          });
         }
       }
 
-      // 4. Advanced Fallback: Search inbox relays of conversation partners
+      if (allMatches.length > 0) {
+        setSearchResults(allMatches.sort((a, b) => scoreProfile(b) - scoreProfile(a)));
+        setIsSyncing(false);
+        // If we have a good number of trusted results, we can stop here
+        if (allMatches.length >= 5) return;
+      }
+
+      // 4. Relay Search (NIP-50) - Fallback to "Beefier" Relays
+      const relayResults = await searchOnRelays(SEARCH_RELAYS, query, 20);
+      const newRelayResults = relayResults.filter(r => !seenPubkeys.has(r.pubkey));
+      
+      if (newRelayResults.length > 0) {
+        const combined = [...allMatches, ...newRelayResults]
+          .filter(r => r.profile && (r.profile.name || r.profile.display_name || r.profile.picture))
+          .sort((a, b) => scoreProfile(b) - scoreProfile(a));
+          
+        if (combined.length > 0) {
+          setSearchResults(combined);
+          setIsSyncing(false);
+          return;
+        }
+      }
+
+      // 5. Final Fallback: Search inbox relays of conversation partners
       const partnerInboxRelays = await getInboxRelaysOfPartners();
       if (partnerInboxRelays.length > 0) {
-        if (isResolvedPubkey) {
-          const p = await fetchProfile(targetPk, false, partnerInboxRelays);
-          if (p) {
-            setSearchResults([{ pubkey: targetPk, profile: p }]);
-            setIsSyncing(false);
-            return;
-          }
-        } else {
-          // Keyword search on partner inbox relays
-          const results = await searchOnRelays(partnerInboxRelays, query);
-          if (results.length > 0) {
-            setSearchResults(results);
-            setIsSyncing(false);
-            return;
-          }
+        const results = await searchOnRelays(partnerInboxRelays, query, 10);
+        if (results.length > 0) {
+          setSearchResults(results.sort((a, b) => scoreProfile(b) - scoreProfile(a)));
+          setIsSyncing(false);
+          return;
         }
       }
 
-      showToast("No results found", "info");
+      showToast("No verified or high-quality results found", "info");
     } catch (err) {
       console.error('Search failed:', err);
       showToast("Search failed", "error");
@@ -2014,26 +2364,25 @@ export default function App() {
             </div>
           </div>
 
-          <div className="space-y-3">
-            <button 
-              onClick={() => setShowKeyInput(true)} 
-              className="w-full py-4 bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-all flex items-center justify-center gap-2 group"
-            >
-              <Shield size={18} className="text-emerald-500 group-hover:scale-110 transition-transform" />
-              Login with Key
-            </button>
-            <div className="grid grid-cols-3 gap-2">
-              <button onClick={() => window.nostr && loginNip07()} className="py-3 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400 text-[10px] font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:text-black dark:hover:text-white transition-all flex items-center justify-center gap-1">
-                <Smartphone size={12} className="text-blue-500" /> NIP-07
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 gap-3">
+              <button 
+                onClick={() => window.nostr && loginNip07()} 
+                className="w-full py-4 bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-all flex items-center justify-center gap-3 group"
+              >
+                <Smartphone size={20} className="text-blue-500 group-hover:scale-110 transition-transform" />
+                Login with Extension (NIP-07)
               </button>
-              <button onClick={() => setShowBunkerInput(true)} className="py-3 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400 text-[10px] font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:text-black dark:hover:text-white transition-all flex items-center justify-center gap-1">
-                <Shield size={12} className="text-emerald-500" /> NIP-46
-              </button>
-              <button onClick={loginNip55} className="py-3 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400 text-[10px] font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:text-black dark:hover:text-white transition-all flex items-center justify-center gap-1">
-                <Smartphone size={12} className="text-blue-500" /> NIP-55
+              <button 
+                onClick={() => setShowBunkerInput(true)} 
+                className="w-full py-4 bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-all flex items-center justify-center gap-3 group"
+              >
+                <Shield size={20} className="text-emerald-500 group-hover:scale-110 transition-transform" />
+                Login with Bunker (NIP-46)
               </button>
             </div>
-            <div className="pt-4">
+
+            <div className="py-4 border-y border-zinc-100 dark:border-zinc-900">
               <button 
                 onClick={() => loginLocal(generateSecretKey())} 
                 className="w-full py-4 bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white font-bold rounded-none hover:opacity-90 transition-all active:scale-95 shadow-lg shadow-emerald-500/20"
@@ -2041,10 +2390,18 @@ export default function App() {
                 Start New Identity
               </button>
             </div>
+
+            <button 
+              onClick={() => setShowKeyInput(true)} 
+              className="w-full py-3 text-zinc-500 dark:text-zinc-400 text-[10px] font-bold uppercase tracking-widest hover:text-black dark:hover:text-white transition-colors flex items-center justify-center gap-2"
+            >
+              <Key size={12} />
+              Login with private key
+            </button>
           </div>
 
-          <p className="text-[10px] text-zinc-600 leading-relaxed">
-            Your keys, your messages. End-to-end encrypted via NIP-17.<br/>No servers, no tracking, just Nostr.
+          <p className="text-[10px] text-zinc-600 leading-relaxed uppercase tracking-widest font-bold">
+            Search profiles, send messages. Nostr.
           </p>
         </motion.div>
 
@@ -2117,12 +2474,11 @@ export default function App() {
         {/* Sidebar Header */}
         <div className="p-6 border-b border-zinc-200 dark:border-zinc-900 flex items-center justify-between bg-zinc-50/50 dark:bg-zinc-950/50">
           <div className="flex items-center gap-3">
-            <button 
+            <HexagonAvatar 
+              src={profile?.picture} 
+              size={40} 
               onClick={() => setSelectedProfile(pubKey)}
-              className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 transition-colors"
-            >
-              {profile?.picture ? <img src={profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <div className="w-full h-full flex items-center justify-center"><User size={20} className="text-zinc-400 dark:text-zinc-600" /></div>}
-            </button>
+            />
             <button 
               onClick={() => setSelectedProfile(pubKey)}
               className="min-w-0 text-left group"
@@ -2155,6 +2511,12 @@ export default function App() {
           >
             Contacts
           </button>
+          <button 
+            onClick={() => setSidebarTab('priority')}
+            className={`flex-1 py-4 text-[10px] font-bold uppercase tracking-widest transition-all border-b-2 ${sidebarTab === 'priority' ? 'text-emerald-500 border-emerald-500' : 'text-zinc-400 border-transparent hover:text-zinc-600 dark:hover:text-zinc-200'}`}
+          >
+            Priority
+          </button>
         </div>
 
         {/* Search Bar */}
@@ -2163,7 +2525,7 @@ export default function App() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 dark:text-zinc-500" />
             <input 
               type="text" 
-              placeholder={sidebarTab === 'contacts' ? "Search contacts or npub..." : "Search messages..."} 
+              placeholder={sidebarTab === 'contacts' ? "Search contacts or npub..." : sidebarTab === 'priority' ? "Search priority or npub..." : "Search messages..."} 
               value={searchQuery} 
               onChange={(e) => setSearchQuery(e.target.value)} 
               onKeyDown={(e) => e.key === 'Enter' && handleSearch()} 
@@ -2182,17 +2544,30 @@ export default function App() {
                   <p className="px-2 py-1 text-[9px] font-bold text-emerald-500 uppercase tracking-widest">Global Search Results</p>
                   {searchResults.map(res => (
                     <button key={res.pubkey} onClick={() => setSelectedProfile(res.pubkey)} className="w-full p-2 flex items-center gap-3 hover:bg-zinc-50 dark:hover:bg-zinc-900 rounded-none text-left transition-colors group">
-                      <div className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 shrink-0">
-                        {res.profile?.picture ? <img src={res.profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={20} className="m-auto text-zinc-400 dark:text-zinc-600" />}
-                      </div>
+                      <HexagonAvatar src={res.profile?.picture} size={40} />
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm font-bold truncate group-hover:text-emerald-500 transition-colors">{res.profile?.display_name || res.profile?.name || 'Unknown'}</p>
-                          {contacts.some(c => c.pubkey === res.pubkey) && (
-                            <span className="px-1 py-0.5 bg-emerald-500/10 text-emerald-500 text-[8px] font-bold uppercase tracking-tighter">Followed</span>
+                        <div className="flex items-center gap-2 min-w-0">
+                          <p className="text-sm font-bold truncate group-hover:text-emerald-500 transition-colors shrink">{getDisplayName(res.pubkey, res.profile)}</p>
+                          {res.profile?.nip05 && (
+                            <CheckCircle size={10} className="text-emerald-500 shrink-0" title={`Verified: ${res.profile.nip05}`} />
                           )}
+                          <ProfileBadges 
+                            isFollowed={contacts.some(c => c.pubkey === res.pubkey)}
+                            isPriority={res.isPriority}
+                            isWoT={res.isWoT}
+                            followedByCount={res.followedBy?.length}
+                          />
                         </div>
-                        <p className="text-[10px] text-zinc-500 font-mono truncate">{formatNpub(res.pubkey).slice(0, 16)}...</p>
+                        <p className="text-[10px] text-zinc-500 font-mono truncate">{res.profile?.nip05 || formatNpub(res.pubkey).slice(0, 16) + '...'}</p>
+                        {res.trustScores && res.trustScores.length > 0 && (
+                          <div className="flex items-center gap-1 mt-0.5">
+                            <Star size={8} className="text-amber-500 fill-amber-500" />
+                            <span className="text-[8px] font-bold text-amber-600">
+                              {(res.trustScores.reduce((acc, r) => acc + r.score, 0) / res.trustScores.length * 100).toFixed(0)}%
+                            </span>
+                            <span className="text-[7px] text-zinc-400">({res.trustScores.length} scores)</span>
+                          </div>
+                        )}
                       </div>
                     </button>
                   ))}
@@ -2204,17 +2579,24 @@ export default function App() {
                     key={contact.pubkey} 
                     className={`w-full p-2 flex items-center gap-3 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors group rounded-none ${activeChat === contact.pubkey ? 'bg-zinc-100 dark:bg-zinc-900' : ''}`}
                   >
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); setSelectedProfile(contact.pubkey); }}
-                      className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 shrink-0 hover:border-emerald-500 transition-colors"
-                    >
-                      {contact.profile?.picture ? <img src={contact.profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={20} className="m-auto text-zinc-400 dark:text-zinc-600" />}
-                    </button>
+                    <HexagonAvatar 
+                      src={contact.profile?.picture} 
+                      size={40} 
+                      onClick={() => setSelectedProfile(contact.pubkey)}
+                    />
                     <button 
                       onClick={() => setActiveChat(contact.pubkey)}
                       className="flex-1 min-w-0 text-left"
                     >
-                      <p className="text-sm font-bold truncate group-hover:text-emerald-500 transition-colors">{contact.profile?.display_name || contact.profile?.name || 'Unknown'}</p>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <p className="text-sm font-bold truncate group-hover:text-emerald-500 transition-colors shrink">{getDisplayName(contact.pubkey, contact.profile)}</p>
+                        <ProfileBadges 
+                          isFollowed={true}
+                          isPriority={priorityPubkeys.includes(contact.pubkey)}
+                          isWoT={wotPubkeys.includes(contact.pubkey)}
+                          followedByCount={wotFollowMap[contact.pubkey]?.length}
+                        />
+                      </div>
                       <p className="text-[10px] text-zinc-500 font-mono truncate">{formatNpub(contact.pubkey).slice(0, 16)}...</p>
                     </button>
                     <button 
@@ -2233,6 +2615,53 @@ export default function App() {
                 </div>
               )}
             </div>
+          ) : sidebarTab === 'priority' ? (
+            <div className="p-2 space-y-1">
+              {priorityPubkeys.length > 0 ? (
+                priorityPubkeys.map(pk => {
+                  const contact = contacts.find(c => c.pubkey === pk) || searchResults.find(r => r.pubkey === pk);
+                  return (
+                    <div 
+                      key={pk} 
+                      className="w-full p-2 flex items-center gap-3 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors group rounded-none"
+                    >
+                      <HexagonAvatar 
+                        src={contact?.profile?.picture} 
+                        size={40} 
+                        onClick={() => setSelectedProfile(pk)}
+                      />
+                      <button 
+                        onClick={() => setActiveChat(pk)}
+                        className="flex-1 min-w-0 text-left"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <p className="text-sm font-bold truncate group-hover:text-amber-500 transition-colors shrink">{getDisplayName(pk, contact?.profile)}</p>
+                          <ProfileBadges 
+                            isFollowed={contacts.some(c => c.pubkey === pk)}
+                            isPriority={true}
+                            isWoT={wotPubkeys.includes(pk)}
+                            followedByCount={wotFollowMap[pk]?.length}
+                          />
+                        </div>
+                        <p className="text-[10px] text-zinc-500 font-mono truncate">{formatNpub(pk).slice(0, 16)}...</p>
+                      </button>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); togglePriority(pk); }}
+                        className="p-2 text-zinc-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                        title="Remove Priority"
+                      >
+                        <ShieldAlert size={16} />
+                      </button>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="p-12 text-center space-y-2 opacity-50">
+                  <ShieldCheck size={24} className="mx-auto text-zinc-400" />
+                  <p className="text-[10px] uppercase tracking-widest font-bold">No priority profiles</p>
+                </div>
+              )}
+            </div>
           ) : (
             <div className="space-y-0.5">
               {filteredConversations.length > 0 ? (
@@ -2241,20 +2670,29 @@ export default function App() {
                     key={conv.pubkey} 
                     className={`w-full p-4 flex items-center gap-4 rounded-none transition-all border-l-4 ${activeChat === conv.pubkey ? 'bg-zinc-50 dark:bg-zinc-900 border-emerald-500' : 'hover:bg-zinc-50 dark:hover:bg-zinc-950 border-transparent'}`}
                   >
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); setSelectedProfile(conv.pubkey); }}
-                      className="w-12 h-12 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden relative border border-zinc-200 dark:border-zinc-800 shrink-0 hover:border-emerald-500 transition-colors"
-                    >
-                      {conv.profile?.picture ? <img src={conv.profile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={24} className="m-auto text-zinc-400 dark:text-zinc-600" />}
-                      {conv.unreadCount > 0 && <div className="absolute top-0 right-0 w-4 h-4 bg-emerald-500 text-white rounded-none text-[8px] font-bold flex items-center justify-center border-2 border-white dark:border-black">{conv.unreadCount}</div>}
-                    </button>
+                    <div className="relative shrink-0">
+                      <HexagonAvatar 
+                        src={conv.profile?.picture} 
+                        size={48} 
+                        onClick={() => setSelectedProfile(conv.pubkey)}
+                      />
+                      {conv.unreadCount > 0 && <div className="absolute top-0 right-0 w-4 h-4 bg-emerald-500 text-white rounded-none text-[8px] font-bold flex items-center justify-center border-2 border-white dark:border-black z-10">{conv.unreadCount}</div>}
+                    </div>
                     <button 
                       onClick={() => setActiveChat(conv.pubkey)}
                       className="flex-1 min-w-0 text-left"
                     >
                       <div className="flex justify-between items-baseline mb-0.5">
-                        <p className={`text-sm font-bold truncate ${activeChat === conv.pubkey ? 'text-emerald-600 dark:text-emerald-400' : ''}`}>{conv.profile?.display_name || conv.profile?.name || 'Unknown'}</p>
-                        <span className="text-[9px] text-zinc-400 dark:text-zinc-600 font-mono">{formatDistanceToNow(conv.lastMessage.created_at * 1000)}</span>
+                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                          <p className={`text-sm font-bold truncate shrink ${activeChat === conv.pubkey ? 'text-emerald-600 dark:text-emerald-400' : ''}`}>{getDisplayName(conv.pubkey, conv.profile)}</p>
+                          <ProfileBadges 
+                            isFollowed={contacts.some(c => c.pubkey === conv.pubkey)}
+                            isPriority={priorityPubkeys.includes(conv.pubkey)}
+                            isWoT={wotPubkeys.includes(conv.pubkey)}
+                            followedByCount={wotFollowMap[conv.pubkey]?.length}
+                          />
+                        </div>
+                        <span className="text-[9px] text-zinc-400 dark:text-zinc-600 font-mono shrink-0 ml-2">{formatDistanceToNow(conv.lastMessage.created_at * 1000)}</span>
                       </div>
                       <p className="text-xs truncate text-zinc-500 leading-tight">{conv.lastMessage.content}</p>
                     </button>
@@ -2289,17 +2727,24 @@ export default function App() {
             <div className="p-4 md:p-6 border-b border-zinc-200 dark:border-zinc-900 flex items-center justify-between bg-white/50 dark:bg-black/50 backdrop-blur-xl sticky top-0 z-10">
               <div className="flex items-center gap-4">
                 <button onClick={() => setActiveChat(null)} className="md:hidden p-2 text-zinc-400 dark:text-zinc-500 hover:text-emerald-500"><ArrowLeft size={20} /></button>
+                <HexagonAvatar 
+                  src={conversations.find(c => c.pubkey === activeChat)?.profile?.picture} 
+                  size={40} 
+                  onClick={() => setSelectedProfile(activeChat)}
+                />
                 <button 
                   onClick={() => setSelectedProfile(activeChat)}
-                  className="w-10 h-10 hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 transition-colors"
+                  className="text-left group min-w-0"
                 >
-                  {conversations.find(c => c.pubkey === activeChat)?.profile?.picture ? <img src={conversations.find(c => c.pubkey === activeChat)?.profile?.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={20} className="m-auto text-zinc-400 dark:text-zinc-600" />}
-                </button>
-                <button 
-                  onClick={() => setSelectedProfile(activeChat)}
-                  className="text-left group"
-                >
-                  <h2 className="font-bold text-base group-hover:text-emerald-500 transition-colors">{conversations.find(c => c.pubkey === activeChat)?.profile?.display_name || conversations.find(c => c.pubkey === activeChat)?.profile?.name || 'Anonymous'}</h2>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <h2 className="font-bold text-base group-hover:text-emerald-500 transition-colors truncate shrink">{getDisplayName(activeChat, conversations.find(c => c.pubkey === activeChat)?.profile)}</h2>
+                    <ProfileBadges 
+                      isFollowed={contacts.some(c => c.pubkey === activeChat)}
+                      isPriority={priorityPubkeys.includes(activeChat!)}
+                      isWoT={wotPubkeys.includes(activeChat!)}
+                      followedByCount={wotFollowMap[activeChat!]?.length}
+                    />
+                  </div>
                   <p className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono">{formatNpub(activeChat).slice(0, 24)}...</p>
                 </button>
               </div>
@@ -2542,8 +2987,78 @@ export default function App() {
         )}
       </div>
 
-      {/* Profile Card Modal */}
+      {/* Trust Score Form Modal */}
       <AnimatePresence>
+        {showTrustScoreForm && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              onClick={() => setShowTrustScoreForm(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl"
+            >
+              <div className="space-y-1">
+                <h3 className="text-xl font-bold uppercase tracking-tighter">Assign Trust Score</h3>
+                <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-bold">How much do you trust this profile?</p>
+              </div>
+              
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Trust Level</label>
+                  <div className="flex items-center gap-2">
+                    {[...Array(5)].map((_, i) => (
+                      <button 
+                        key={i} 
+                        onClick={() => setTrustScoreValue((i + 1) / 5)}
+                        className="p-1 hover:scale-110 transition-transform"
+                      >
+                        <Star 
+                          size={24} 
+                          className={i < trustScoreValue * 5 ? 'text-amber-500 fill-amber-500' : 'text-zinc-200 dark:text-zinc-800'} 
+                        />
+                      </button>
+                    ))}
+                    <span className="text-sm font-bold text-amber-500 ml-2">{(trustScoreValue * 100).toFixed(0)}%</span>
+                  </div>
+                </div>
+                
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Trust Context</label>
+                  <textarea 
+                    value={trustScoreContext}
+                    onChange={(e) => setTrustScoreContext(e.target.value)}
+                    placeholder="Why do you trust (or distrust) this user?"
+                    className="w-full h-32 bg-zinc-50 dark:bg-black border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 transition-colors resize-none"
+                  />
+                </div>
+              </div>
+              
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => setShowTrustScoreForm(false)}
+                  className="flex-1 py-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500 hover:text-zinc-700 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={submitTrustScore}
+                  disabled={!trustScoreContext.trim()}
+                  className="flex-1 py-4 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors disabled:opacity-50"
+                >
+                  Publish Score
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
         {selectedProfile && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
             <motion.div 
@@ -2574,17 +3089,12 @@ export default function App() {
 
               {/* Profile Info */}
               <div className="px-6 pb-8 -mt-12 relative">
-                <div className="w-24 h-24 hexagon bg-white dark:bg-zinc-950 p-1 border border-zinc-200 dark:border-zinc-900 mb-4">
-                  <div className="w-full h-full hexagon bg-zinc-100 dark:bg-zinc-900 overflow-hidden flex items-center justify-center">
-                    {!viewingProfile ? (
-                      <Loader2 size={32} className="animate-spin text-emerald-500/20" />
-                    ) : viewingProfile?.picture ? (
-                      <img src={viewingProfile.picture} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                    ) : (
-                      <User size={40} className="text-zinc-400 dark:text-zinc-600" />
-                    )}
-                  </div>
-                </div>
+                <HexagonAvatar 
+                  src={viewingProfile?.picture} 
+                  size={96} 
+                  className="mb-4"
+                  fallback={!viewingProfile ? <Loader2 size={32} className="animate-spin text-emerald-500/20" /> : undefined}
+                />
 
                 {!viewingProfile ? (
                   <div className="space-y-4 animate-pulse">
@@ -2598,10 +3108,24 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    <div className="space-y-1">
-                      <h3 className="text-xl font-black italic tracking-tighter">
-                        {viewingProfile?.display_name || viewingProfile?.name || 'Unknown User'}
-                      </h3>
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <h3 className="text-xl font-black italic tracking-tighter truncate shrink">
+                          {getDisplayName(selectedProfile!, viewingProfile)}
+                        </h3>
+                        {contacts.find(c => c.pubkey === selectedProfile)?.petname && (
+                          <span className="text-[10px] text-zinc-400 dark:text-zinc-600 font-medium italic shrink-0">
+                            ({viewingProfile?.display_name || viewingProfile?.name || 'Anonymous'})
+                          </span>
+                        )}
+                        <ProfileBadges 
+                          isFollowed={contacts.some(c => c.pubkey === selectedProfile)}
+                          isPriority={priorityPubkeys.includes(selectedProfile!)}
+                          isWoT={wotPubkeys.includes(selectedProfile!)}
+                          followedByCount={wotFollowMap[selectedProfile!]?.length}
+                          className="mt-1"
+                        />
+                      </div>
                       {viewingProfile?.nip05 && (
                         <p className="text-xs text-emerald-500 font-medium">{viewingProfile.nip05}</p>
                       )}
@@ -2609,6 +3133,56 @@ export default function App() {
                         {formatNpub(selectedProfile)}
                       </p>
                     </div>
+
+                    {selectedProfile !== pubKey && (
+                      <div className="mt-4">
+                        {isEditingPetname ? (
+                          <div className="flex gap-2">
+                            <input 
+                              type="text"
+                              value={petnameInput}
+                              onChange={(e) => setPetnameInput(e.target.value)}
+                              placeholder="Assign petname..."
+                              className="flex-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 px-3 py-2 text-xs font-medium focus:outline-none focus:border-emerald-500"
+                              autoFocus
+                            />
+                            <button 
+                              onClick={() => {
+                                updatePetname(selectedProfile!, petnameInput);
+                                setIsEditingPetname(false);
+                              }}
+                              className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
+                            >
+                              Save
+                            </button>
+                            <button 
+                              onClick={() => setIsEditingPetname(false)}
+                              className="px-4 py-2 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 text-[10px] font-bold uppercase tracking-widest hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button 
+                            onClick={() => setIsEditingPetname(true)}
+                            className="text-[10px] font-bold text-zinc-400 hover:text-emerald-500 uppercase tracking-tighter flex items-center gap-1.5 transition-colors"
+                          >
+                            <Type size={12} /> {contacts.find(c => c.pubkey === selectedProfile)?.petname ? 'Edit Petname' : 'Assign Petname'}
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {viewingTrustInfo.followedBy.length > 0 && (
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        <div className="px-2 py-1 bg-blue-500/10 border border-blue-500/20 rounded-none flex items-center gap-1.5">
+                          <Users size={10} className="text-blue-500" />
+                          <span className="text-[9px] font-bold text-blue-600 uppercase tracking-tighter">
+                            Followed by {viewingTrustInfo.followedBy.length} {viewingTrustInfo.followedBy.length === 1 ? 'contact' : 'contacts'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
 
                     {viewingProfile?.about && (
                       <div className="mt-6">
@@ -2645,6 +3219,59 @@ export default function App() {
                         </div>
                       </div>
                     )}
+
+                    {/* Trust Scores Section */}
+                    <div className="mt-8 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Trust Scores</p>
+                        {selectedProfile !== pubKey && (
+                          <button 
+                            onClick={() => setShowTrustScoreForm(true)}
+                            className="text-[9px] font-bold text-emerald-500 hover:text-emerald-600 uppercase tracking-tighter"
+                          >
+                            Assign Score
+                          </button>
+                        )}
+                      </div>
+                      
+                      {viewingTrustScores.length > 0 ? (
+                        <div className="space-y-3 max-h-48 overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800">
+                          {viewingTrustScores.map(score => (
+                            <div key={score.id} className="p-3 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none space-y-2">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-1">
+                                  {[...Array(5)].map((_, i) => (
+                                    <Star 
+                                      key={i} 
+                                      size={10} 
+                                      className={i < score.score * 5 ? 'text-amber-500 fill-amber-500' : 'text-zinc-300 dark:text-zinc-700'} 
+                                    />
+                                  ))}
+                                  <span className="text-[9px] font-bold text-amber-600 ml-1">{(score.score * 100).toFixed(0)}%</span>
+                                </div>
+                                <span className="text-[8px] text-zinc-400 font-mono">
+                                  {formatDistanceToNow(score.created_at * 1000)} ago
+                                </span>
+                              </div>
+                              <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed italic">
+                                "{score.content}"
+                              </p>
+                              <div className="flex items-center gap-1.5 pt-1">
+                                <div className="w-3 h-3 rounded-full bg-zinc-200 dark:bg-zinc-800" />
+                                <span className="text-[8px] text-zinc-500 font-mono truncate">
+                                  {formatNpub(score.pubkey).slice(0, 12)}...
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-6 text-center border border-dashed border-zinc-200 dark:border-zinc-800 rounded-none opacity-50">
+                          <Star size={16} className="mx-auto text-zinc-300 dark:text-zinc-700 mb-2" />
+                          <p className="text-[9px] uppercase tracking-widest font-bold">No trust scores assigned</p>
+                        </div>
+                      )}
+                    </div>
                   </>
                 )}
 
@@ -2670,17 +3297,34 @@ export default function App() {
                         )}
                       </button>
                       <button 
+                        disabled={!viewingProfile}
                         onClick={() => {
-                          setActiveChat(selectedProfile);
-                          setSelectedProfile(null);
-                          setSearchResults([]);
-                          setSearchQuery('');
+                          if (selectedProfile) togglePriority(selectedProfile);
                         }}
-                        className="flex-1 flex items-center justify-center gap-2 py-3 text-[10px] font-bold uppercase tracking-widest bg-black dark:bg-white text-white dark:text-black hover:opacity-90 transition-all"
+                        className={`flex-1 flex items-center justify-center gap-2 py-3 text-[10px] font-bold uppercase tracking-widest transition-all border disabled:opacity-50 disabled:cursor-not-allowed ${
+                          priorityPubkeys.includes(selectedProfile!)
+                            ? 'bg-amber-500/10 border-amber-500/30 text-amber-600 hover:bg-amber-500/20'
+                            : 'bg-zinc-100 dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-amber-50 dark:hover:bg-amber-950/30 hover:text-amber-500 hover:border-amber-500/30'
+                        }`}
                       >
-                        <MessageSquare size={14} /> Message
+                        {priorityPubkeys.includes(selectedProfile!) ? (
+                          <><ShieldCheck size={14} /> Prioritized</>
+                        ) : (
+                          <><Shield size={14} /> Prioritize</>
+                        )}
                       </button>
                     </div>
+                    <button 
+                      onClick={() => {
+                        setActiveChat(selectedProfile);
+                        setSelectedProfile(null);
+                        setSearchResults([]);
+                        setSearchQuery('');
+                      }}
+                      className="w-full flex items-center justify-center gap-2 py-3 text-[10px] font-bold uppercase tracking-widest bg-black dark:bg-white text-white dark:text-black hover:opacity-90 transition-all"
+                    >
+                      <MessageSquare size={14} /> Message
+                    </button>
 
                     {conversations.some(c => c.pubkey === selectedProfile) && (
                       <div className="pt-2 space-y-2">
@@ -2758,9 +3402,10 @@ export default function App() {
                   <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Identity</p>
                   <div className="p-4 bg-zinc-50 dark:bg-zinc-900 rounded-none border border-zinc-200 dark:border-zinc-800 space-y-3">
                     <div className="flex items-center gap-3">
-                      <div className="w-12 h-12 hexagon bg-zinc-100 dark:bg-black border border-zinc-200 dark:border-zinc-800 overflow-hidden">
-                        {profile?.picture ? <img src={profile.picture} alt="" className="w-full h-full object-cover" /> : <User size={24} className="m-auto text-zinc-400 dark:text-zinc-700" />}
-                      </div>
+                      <HexagonAvatar 
+                        src={profile?.picture} 
+                        size={48} 
+                      />
                       <div className="min-w-0">
                         <p className="font-bold truncate">{profile?.display_name || profile?.name || 'Anonymous'}</p>
                         <p className="text-[10px] text-zinc-500 font-mono truncate">{formatNpub(pubKey)}</p>
@@ -3050,9 +3695,11 @@ export default function App() {
           <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute inset-0 bg-black/80 dark:bg-black/95 backdrop-blur-xl" />
             <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none text-center space-y-8 shadow-2xl">
-              <div className="w-20 h-20 hexagon bg-zinc-100 dark:bg-zinc-900 flex items-center justify-center mx-auto border border-zinc-200 dark:border-zinc-800">
-                <Unlock size={32} className="text-emerald-500" />
-              </div>
+              <HexagonAvatar 
+                size={80} 
+                className="mx-auto"
+                fallback={<Unlock size={32} className="text-emerald-500" />}
+              />
               <div className="space-y-2">
                 <h3 className="text-2xl font-bold">Decrypt Messages</h3>
                 <p className="text-sm text-zinc-500">We found {pendingEncryptedEvents.length} encrypted messages. Would you like to decrypt them now?</p>
