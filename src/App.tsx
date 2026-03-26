@@ -8,7 +8,8 @@ import {
   finalizeEvent,
   getEventHash,
   verifyEvent,
-  nip19
+  nip19,
+  Relay
 } from 'nostr-tools';
 import * as nip44 from 'nostr-tools/nip44';
 import * as nip46 from 'nostr-tools/nip46';
@@ -60,6 +61,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { formatDistanceToNow } from 'date-fns';
 import Dexie, { type Table } from 'dexie';
+import Fuse from 'fuse.js';
 
 declare global {
   interface Window {
@@ -451,7 +453,10 @@ const KIND_DM = 14;
 const KIND_SEAL = 13;
 const KIND_GIFT_WRAP = 1059;
 const KIND_REVIEW = 1985; // NIP-85 Label
+const DEFAULT_BLOSSOM_SERVERS = ['https://blossom.primal.net', 'https://nostr.download', 'https://cdn.nostr.build'];
+
 const KIND_BLOSSOM_LIST = 10063;
+const KIND_RELAY_INFO = 30066; // NIP-66
 
 const parseTrustScore = (event: Event): NostrTrustScore | null => {
   // NIP-85 Label can use 'rating' tag or 'l' tag with 'trust' namespace
@@ -617,6 +622,8 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeChat, setActiveChat] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncTime, setLastSyncTime] = useState<number>(() => Number(localStorage.getItem('pam_last_sync')) || 0);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Contact[]>([]);
   const [priorityPubkeys, setPriorityPubkeys] = useState<string[]>(() => {
@@ -645,11 +652,13 @@ export default function App() {
   };
 
   const [isSearching, setIsSearching] = useState(false);
+  const [searchAbortController, setSearchAbortController] = useState<AbortController | null>(null);
   const [petnameInput, setPetnameInput] = useState('');
   const [isEditingPetname, setIsEditingPetname] = useState(false);
 
   const [newMessage, setNewMessage] = useState('');
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'general' | 'relays' | 'blossom'>('general');
   const [showLogoutWarning, setShowLogoutWarning] = useState(false);
   const [showKeyInput, setShowKeyInput] = useState(false);
   const [keyInput, setKeyInput] = useState('');
@@ -711,6 +720,7 @@ export default function App() {
     const saved = localStorage.getItem('pam_dm_relays');
     return saved ? JSON.parse(saved) : DEFAULT_RELAYS;
   });
+  const [relayDiscovery, setRelayDiscovery] = useState<Record<string, any>>({});
   const [deletedMessageIds, setDeletedMessageIds] = useState<Set<string>>(() => {
     const saved = localStorage.getItem('pam_deleted_messages');
     return saved ? new Set(JSON.parse(saved)) : new Set();
@@ -801,13 +811,31 @@ export default function App() {
     return { followedBy: [] };
   }, [selectedProfile, searchResults, contacts.length]);
 
-  const fetchTrustScores = useCallback(async (pk: string) => {
+  const fetchTrustScores = useCallback(async (pk: string, signal?: AbortSignal) => {
+    if (signal?.aborted) return [];
     const relays = [...DEFAULT_RELAYS, ...SEARCH_RELAYS];
-    const events = await pool.current.querySync(relays, { kinds: [KIND_REVIEW], '#p': [pk] });
-    return events.map(parseTrustScore).filter((r): r is NostrTrustScore => r !== null);
+    try {
+      const events = await Promise.race([
+        pool.current.querySync(relays, { kinds: [KIND_REVIEW], '#p': [pk] }),
+        new Promise<Event[]>((_, reject) => {
+          const timeoutId = setTimeout(() => reject(new Error('Trust scores timeout')), 5000);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timeoutId);
+            reject(new Error('AbortError'));
+          });
+        })
+      ]);
+      if (signal?.aborted) return [];
+      return events.map(parseTrustScore).filter((r): r is NostrTrustScore => r !== null);
+    } catch (e) {
+      if (e instanceof Error && e.message === 'AbortError') return [];
+      console.warn("Fetch trust scores failed", e);
+      return [];
+    }
   }, []);
 
-  const fetchProfile = useCallback(async (pk: string, force = false, customRelays?: string[]) => {
+  const fetchProfile = useCallback(async (pk: string, force = false, customRelays?: string[], signal?: AbortSignal) => {
+    if (signal?.aborted) return null;
     if (!force) {
       const cached = await localDb.profiles.get(pk);
       if (cached && Date.now() - cached.timestamp < 3600000) {
@@ -815,15 +843,31 @@ export default function App() {
         return cached.profile;
       }
     }
+    if (signal?.aborted) return null;
     const relays = customRelays || (userDmRelays.length > 0 ? [...new Set([...INDEXER_RELAYS, ...userDmRelays])] : INDEXER_RELAYS);
-    const event = await pool.current.get(relays, { kinds: [0], authors: [pk] });
-    if (event) {
-      try {
-        const p = JSON.parse(event.content);
-        if (pk === pubKey) setProfile(p);
-        localDb.profiles.put({ pubkey: pk, profile: p, timestamp: Date.now() });
-        return p;
-      } catch {}
+    try {
+      const event = await Promise.race([
+        pool.current.get(relays, { kinds: [0], authors: [pk] }),
+        new Promise<Event | null>((_, reject) => {
+          const timeoutId = setTimeout(() => reject(new Error('Profile fetch timeout')), 5000);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timeoutId);
+            reject(new Error('AbortError'));
+          });
+        })
+      ]);
+      if (signal?.aborted) return null;
+      if (event) {
+        try {
+          const p = JSON.parse(event.content);
+          if (pk === pubKey) setProfile(p);
+          localDb.profiles.put({ pubkey: pk, profile: p, timestamp: Date.now() });
+          return p;
+        } catch {}
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message === 'AbortError') return null;
+      console.warn("Fetch profile failed", e);
     }
     return null;
   }, [pubKey, userDmRelays]);
@@ -920,8 +964,73 @@ export default function App() {
       loadLocalData();
       fetchProfile(pubKey);
       importExistingData();
+      fetchRelayDiscovery();
     }
   }, [pubKey]);
+
+  const fetchRelayDiscovery = async () => {
+    try {
+      const events = await pool.current.querySync(INDEXER_RELAYS, { kinds: [KIND_RELAY_INFO], limit: 50 });
+      const discovery: Record<string, any> = {};
+      events.forEach(ev => {
+        const dTag = ev.tags.find(t => t[0] === 'd');
+        if (dTag) {
+          discovery[dTag[1]] = {
+            ...JSON.parse(ev.content),
+            pubkey: ev.pubkey,
+            created_at: ev.created_at
+          };
+        }
+      });
+      setRelayDiscovery(discovery);
+    } catch (e) {
+      console.error("Failed to fetch NIP-66 relay discovery", e);
+    }
+  };
+
+  // NIP-42 Relay Authentication
+  useEffect(() => {
+    if (!pubKey || !loginMethod) return;
+
+    const relays = [...new Set([...userDmRelays, ...DEFAULT_RELAYS, ...INDEXER_RELAYS, ...SEARCH_RELAYS])];
+    
+    relays.forEach(async (url) => {
+      try {
+        const relay = await pool.current.ensureRelay(url);
+        relay.onauth = async (challenge: string) => {
+          console.log(`Relay ${relay.url} requested AUTH with challenge: ${challenge}`);
+          try {
+            // Normalize relay URL for AUTH event (some relays are picky about trailing slashes)
+            const normalizedRelayUrl = relay.url.endsWith('/') ? relay.url.slice(0, -1) : relay.url;
+            const authEventTemplate = {
+              kind: 22242,
+              created_at: Math.floor(Date.now() / 1000),
+              tags: [
+                ['relay', normalizedRelayUrl],
+                ['challenge', challenge]
+              ],
+              content: ''
+            };
+            
+            let signed = await signEvent({ ...authEventTemplate, pubkey: pubKey } as UnsignedEvent);
+            
+            console.log("Sending AUTH event:", signed);
+            
+            if (!signed.sig || !signed.id) {
+              throw new Error("Bunker returned an unsigned or invalid event");
+            }
+
+            relay.auth(signed);
+            showToast(`Authenticated with ${relay.url}`, "info");
+          } catch (err) {
+            console.error(`Failed to sign AUTH event for ${relay.url}`, err);
+          }
+        };
+      } catch (e) {
+        // Relay connection might fail, that's okay
+      }
+    });
+  }, [pubKey, loginMethod, userDmRelays]);
 
   useEffect(() => {
     // No longer scrolling to bottom as newest messages are at the top
@@ -949,6 +1058,10 @@ export default function App() {
     const convs = await localDb.conversations.toArray();
     setConversations(convs);
   };
+
+  useEffect(() => {
+    localStorage.setItem('pam_last_sync', lastSyncTime.toString());
+  }, [lastSyncTime]);
 
   const importExistingData = async () => {
     if (!pubKey) return;
@@ -987,15 +1100,24 @@ export default function App() {
         });
       }
 
-
-      // 3. Fetch Gift Wraps (KIND 1059)
-      const events = await pool.current.querySync(searchRelays, { kinds: [KIND_GIFT_WRAP], '#p': [pubKey], limit: 100 });
+      // 3. Fetch Gift Wraps (KIND 1059) with 'since' filter for efficiency (Amethyst/Wisp style)
+      const latestMsg = messages.length > 0 ? messages.reduce((prev, curr) => prev.created_at > curr.created_at ? prev : curr) : null;
+      const since = latestMsg ? Math.max(latestMsg.created_at + 1, lastSyncTime) : lastSyncTime;
+      
+      const events = await pool.current.querySync(searchRelays, { 
+        kinds: [KIND_GIFT_WRAP], 
+        '#p': [pubKey], 
+        since,
+        limit: 500 
+      });
+      
       if (events.length > 0) {
         setPendingEncryptedEvents(events);
         setShowDecryptPrompt(true);
       } else {
         subscribeToMessages();
       }
+      setLastSyncTime(Math.floor(Date.now() / 1000));
     } catch (err) {
       console.error("Failed to import data:", err);
     } finally {
@@ -1062,6 +1184,16 @@ export default function App() {
           const receiverTag = rumor.tags.find((t: any) => t[0] === 'p');
           const receiver = receiverTag ? receiverTag[1] : pubKey;
           
+          // Parse NIP-92 imeta if present
+          const imetaTag = rumor.tags.find((t: any) => t[0] === 'imeta');
+          let imetaData: Record<string, string> = {};
+          if (imetaTag) {
+            imetaTag.slice(1).forEach((part: string) => {
+              const [key, ...val] = part.split(' ');
+              imetaData[key] = val.join(' ');
+            });
+          }
+
           const durationTag = rumor.tags.find((t: any) => t[0] === 'duration');
           const mimeTypeTag = rumor.tags.find((t: any) => t[0] === 'm');
 
@@ -1069,13 +1201,13 @@ export default function App() {
             id: rumor.id || event.id, // Prefer Rumor ID for deduplication
             sender: rumor.pubkey,
             receiver: receiver,
-            content: rumor.content,
+            content: imetaData.url || rumor.content,
             created_at: rumor.created_at,
             isSelf: rumor.pubkey === pubKey,
-            type: rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'image') ? 'image' : 
-                  (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'voice') || rumor.kind === 1222) ? 'voice' : 'text',
-            duration: durationTag ? parseInt(durationTag[1]) : undefined,
-            mimeType: mimeTypeTag ? mimeTypeTag[1] : undefined
+            type: (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'image') || imetaData.m?.startsWith('image/')) ? 'image' : 
+                  (rumor.tags.find((t: any) => t[0] === 't' && t[1] === 'voice') || rumor.kind === 1222 || imetaData.m?.startsWith('audio/')) ? 'voice' : 'text',
+            duration: imetaData.duration ? parseInt(imetaData.duration) : (durationTag ? parseInt(durationTag[1]) : undefined),
+            mimeType: imetaData.m || (mimeTypeTag ? mimeTypeTag[1] : undefined)
           };
           
           setMessages(prev => {
@@ -1196,7 +1328,12 @@ export default function App() {
     if (loginMethod === 'nip07' && window.nostr) return window.nostr.signEvent(template);
     if (loginMethod === 'nip46' && bunkerSession) {
       const response = await nip46Request('sign_event', [JSON.stringify(template)]);
-      return typeof response === 'string' ? JSON.parse(response) : response;
+      try {
+        return typeof response === 'string' ? JSON.parse(response) : response;
+      } catch (e) {
+        console.error("Failed to parse signed event from Bunker", e, response);
+        throw new Error("Bunker returned an invalid signed event format");
+      }
     }
     if (loginMethod === 'nip55') {
       // NIP-55 Android Signer intent
@@ -1236,7 +1373,7 @@ export default function App() {
           try {
             const decrypted = nip44.decrypt(ev.content, nip44.getConversationKey(localPrivkey, remotePubkey));
             const response = JSON.parse(decrypted);
-            if (response.id === id) {
+            if (response && response.id === id) {
               sub.close();
               if (response.error) reject(new Error(response.error));
               else if (response.result === undefined || response.result === null) reject(new Error("NIP-46 response result is empty"));
@@ -1277,7 +1414,9 @@ export default function App() {
       throw new Error("Cannot upload empty file. Recording may have failed.");
     }
     
-    if (!privKey || !pubKey) throw new Error("Keys missing");
+    // Only require pubKey here, privKey is handled by signEvent based on loginMethod
+    if (!pubKey) throw new Error("Public key missing. Please log in first.");
+    if (loginMethod === 'local' && !privKey) throw new Error("Private key missing for local login.");
     
     const buffer = await blob.arrayBuffer();
     const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
@@ -1302,12 +1441,16 @@ export default function App() {
     
     const normalize = (s: string) => s.endsWith('/') ? s.slice(0, -1) : s;
     let servers = [...new Set([...userBlossomServers.map(normalize)])];
+    if (servers.length === 0) {
+      servers = [...DEFAULT_BLOSSOM_SERVERS.map(normalize)];
+    }
     if (preferredBlossomServer) {
       const pref = normalize(preferredBlossomServer);
       // Ensure the preferred server is at the very front
       servers = [pref, ...servers.filter(s => s !== pref)];
     }
-    console.log(`Blossom Upload: Prioritized server list:`, servers);
+    
+    setUploadProgress(0);
     
     for (const normalizedServer of servers) {
       try {
@@ -1320,6 +1463,7 @@ export default function App() {
             const checkResponse = await fetch(checkUrl, { method: 'HEAD' });
             if (checkResponse.ok) {
               console.log(`Blossom Upload: Blob already exists on ${normalizedServer} at ${checkUrl}`);
+              setUploadProgress(100);
               return checkUrl;
             }
           }
@@ -1342,76 +1486,57 @@ export default function App() {
           ],
           content: `Upload ${blob.type || 'file'} to Blossom`
         };
+        
         const signedAuth = await signEvent(authEvent);
+        // Use standard btoa for the JSON string. Nostr events are typically ASCII-safe.
+        // For UTF-8 support in content, we use the standard encodeURIComponent/unescape hack.
         const authHeader = btoa(unescape(encodeURIComponent(JSON.stringify(signedAuth))));
 
-        // Try POST /upload
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000);
-
-        try {
-          const response = await fetch(`${normalizedServer}/upload`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Nostr ${authHeader}`,
-              'Content-Type': blob.type || 'application/octet-stream'
-            },
-            body: blob,
-            mode: 'cors',
-            signal: controller.signal
-          });
+        // Use XHR for progress tracking
+        const uploadPromise = new Promise<string>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', `${normalizedServer}/upload`);
+          xhr.setRequestHeader('Authorization', `Nostr ${authHeader}`);
+          xhr.setRequestHeader('Content-Type', blob.type || 'application/octet-stream');
           
-          clearTimeout(timeoutId);
-
-          if (response.ok) {
-            console.log(`Blossom Upload: Successfully uploaded to ${normalizedServer} via POST`);
-            const result = await response.json();
-            let finalUrl = result.url || `${normalizedServer}/${hashHex}`;
-            // Append extension if missing and we have one
-            if (ext && !finalUrl.toLowerCase().endsWith(ext)) {
-              finalUrl += ext;
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const percentComplete = (event.loaded / event.total) * 100;
+              setUploadProgress(Math.round(percentComplete));
             }
-            return finalUrl;
-          }
-        } catch (postErr) {
-          console.warn(`Blossom Upload: POST to ${normalizedServer} failed:`, postErr);
-        }
+          };
 
-        // 2. Fallback to PUT if POST fails
-        const putAuthEvent = { 
-          ...authEvent, 
-          tags: [
-            ...authEvent.tags.filter(t => t[0] !== 'u'), 
-            ['u', `${normalizedServer}/${hashHex}${ext}`]
-          ] 
-        };
-        const signedPutAuth = await signEvent(putAuthEvent);
-        const putAuthHeader = btoa(unescape(encodeURIComponent(JSON.stringify(signedPutAuth))));
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const result = JSON.parse(xhr.responseText);
+                console.log(`Blossom Upload: Success on ${normalizedServer}`, result);
+                let finalUrl = result.url || `${normalizedServer}/${hashHex}`;
+                if (ext && !finalUrl.toLowerCase().endsWith(ext)) {
+                  finalUrl += ext;
+                }
+                resolve(finalUrl);
+              } catch (e) {
+                console.warn(`Blossom Upload: Could not parse response from ${normalizedServer}, using fallback URL`);
+                resolve(`${normalizedServer}/${hashHex}${ext}`);
+              }
+            } else {
+              console.error(`Blossom Upload: Server ${normalizedServer} returned status ${xhr.status}: ${xhr.responseText}`);
+              reject(new Error(`Upload failed with status ${xhr.status}`));
+            }
+          };
 
-        const putController = new AbortController();
-        const putTimeoutId = setTimeout(() => putController.abort(), 30000);
+          xhr.onerror = () => {
+            console.error(`Blossom Upload: Network error on ${normalizedServer}`);
+            reject(new Error('Network error during upload'));
+          };
+          
+          xhr.send(blob);
+        });
 
-        try {
-          const putResponse = await fetch(`${normalizedServer}/${hashHex}${ext}`, {
-            method: 'PUT',
-            headers: {
-              'Authorization': `Nostr ${putAuthHeader}`,
-              'Content-Type': blob.type || 'application/octet-stream'
-            },
-            body: blob,
-            mode: 'cors',
-            signal: putController.signal
-          });
-
-          clearTimeout(putTimeoutId);
-
-          if (putResponse.ok) {
-            console.log(`Blossom Upload: Successfully uploaded to ${normalizedServer} via PUT`);
-            return `${normalizedServer}/${hashHex}${ext}`;
-          }
-        } catch (putErr) {
-          console.warn(`Blossom Upload: PUT to ${normalizedServer} failed:`, putErr);
-        }
+        const finalUrl = await uploadPromise;
+        setUploadProgress(100);
+        return finalUrl;
       } catch (err) {
         console.error(`Blossom Upload: Failed to process ${normalizedServer}:`, err);
       }
@@ -1485,16 +1610,20 @@ export default function App() {
         tags: [['p', activeChat]], 
         content: text 
       };
-      if (type === 'image') {
-        rumorTemplate.tags.push(['t', 'image']);
+      
+      // NIP-92 / NIP-94 style metadata for media
+      if (type === 'image' || type === 'voice') {
+        const imeta = ['imeta', `url ${text}`];
+        if (mimeType) imeta.push(`m ${mimeType}`);
+        if (duration) imeta.push(`duration ${duration}`);
+        rumorTemplate.tags.push(imeta);
+        
+        // Legacy tags for compatibility
+        rumorTemplate.tags.push(['t', type]);
         if (mimeType) rumorTemplate.tags.push(['m', mimeType]);
-      }
-      if (type === 'voice') {
-        rumorTemplate.tags.push(['t', 'voice']);
         if (duration) rumorTemplate.tags.push(['duration', duration.toString()]);
-        if (mimeType) rumorTemplate.tags.push(['m', mimeType]);
-        else rumorTemplate.tags.push(['m', 'audio/webm']); // Default fallback
       }
+
       const rumor = { ...rumorTemplate, id: getEventHash(rumorTemplate) };
       
       // 1. Create Seals (KIND 13)
@@ -1545,11 +1674,12 @@ export default function App() {
       let finalWrapForReceiver = signedWrapForReceiver;
       if (powDifficulty > 0) {
         let nonce = 0;
+        const baseTags = [...wrapForReceiverTemplate.tags];
         while (true) {
-          const tags = [...finalWrapForReceiver.tags, ['nonce', nonce.toString(), powDifficulty.toString()]];
-          const id = getEventHash({ ...finalWrapForReceiver, tags });
+          const tags = [...baseTags, ['nonce', nonce.toString(), powDifficulty.toString()]];
+          const id = getEventHash({ ...wrapForReceiverTemplate, tags });
           if (validateDifficulty(id, powDifficulty)) {
-            finalWrapForReceiver = { ...finalWrapForReceiver, id, tags };
+            finalWrapForReceiver = finalizeEvent({ ...wrapForReceiverTemplate, tags }, ephemeralPriv);
             break;
           }
           nonce++;
@@ -1557,7 +1687,7 @@ export default function App() {
         }
       }
 
-      const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
+      const relays = [...new Set([...userDmRelays, ...DEFAULT_RELAYS, ...viewingRelays])];
       const publishPromises = [publishWithTimeout(pool.current, relays, finalWrapForReceiver)];
       if (signedWrapForSelf) {
         publishPromises.push(publishWithTimeout(pool.current, relays, signedWrapForSelf));
@@ -2105,17 +2235,28 @@ export default function App() {
     }
   };
 
-  const getWoTPubkeys = async () => {
+  const getWoTPubkeys = async (signal?: AbortSignal) => {
     const directFollows = contacts.map(c => c.pubkey);
-    if (directFollows.length === 0) return { secondDegree: [], followMap: {} };
+    if (directFollows.length === 0 || signal?.aborted) return { secondDegree: [], followMap: {} };
     
     try {
       const searchRelays = userDmRelays.length > 0 ? [...new Set([...DEFAULT_RELAYS, ...userDmRelays])] : DEFAULT_RELAYS;
       // Fetch Kind 3 (Contact Lists) for direct follows
-      const wotEvents = await pool.current.querySync(searchRelays, { 
-        kinds: [3], 
-        authors: directFollows 
-      });
+      const wotEvents = await Promise.race([
+        pool.current.querySync(searchRelays, { 
+          kinds: [3], 
+          authors: directFollows 
+        }),
+        new Promise<Event[]>((_, reject) => {
+          const timeoutId = setTimeout(() => reject(new Error('WoT fetch timeout')), 8000);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timeoutId);
+            reject(new Error('AbortError'));
+          });
+        })
+      ]);
+      
+      if (signal?.aborted) return { secondDegree: [], followMap: {} };
       
       const secondDegree = new Set<string>();
       const followMap: Record<string, string[]> = {};
@@ -2144,6 +2285,7 @@ export default function App() {
         followMap
       };
     } catch (e) {
+      if (e instanceof Error && e.message === 'AbortError') return { secondDegree: [], followMap: {} };
       console.error("Failed to fetch WoT pubkeys", e);
       return { secondDegree: [], followMap: {} };
     }
@@ -2153,47 +2295,87 @@ export default function App() {
     let score = 0;
     
     // NIP-02 Petname is the strongest local signal
-    if (contact.petname) score += 200;
+    if (contact.petname) score += 500;
 
-    if (!contact.profile) return score - 10;
+    // Direct follow is a very strong signal
+    const isFollowed = contacts.some(c => c.pubkey === contact.pubkey);
+    if (isFollowed) score += 300;
+
+    if (!contact.profile) return score - 50;
     
     // NIP-05 verification is a strong signal
     if (contact.profile.nip05) {
-      score += 50;
-      if (contact.profile.nip05.endsWith('@npub.world') || contact.profile.nip05.endsWith('@nostr.com')) {
-        score += 20; // Prioritize well-known providers
+      score += 100;
+      if (contact.profile.nip05.endsWith('@npub.world') || contact.profile.nip05.endsWith('@nostr.com') || contact.profile.nip05.endsWith('@primal.net')) {
+        score += 50; // Prioritize well-known providers
       }
     }
     
     // Metadata completeness
-    if (contact.profile.picture) score += 10;
-    if (contact.profile.display_name || contact.profile.name) score += 10;
-    if (contact.profile.about) score += 5;
-    
-    // WoT signal (if we have it)
-    if (contacts.some(c => c.pubkey === contact.pubkey)) score += 100; // Already a contact
-    if (contact.isPriority) score += 50; // User's local priority
-    if (contact.isWoT) score += 20; // Followed by network
-    
-    // Bonus for multiple follow signals
-    if (contact.followedBy && contact.followedBy.length > 1) score += contact.followedBy.length * 2;
-    
+    if (contact.profile.picture) score += 20;
+    if (contact.profile.display_name || contact.profile.name) score += 20;
+    if (contact.profile.about) score += 10;
+
+    // Web of Trust signals
+    if (contact.isWoT) score += 50;
+    if (contact.followedBy && contact.followedBy.length > 0) {
+      score += Math.min(contact.followedBy.length * 15, 150); // Cap at 150
+    }
+
     // NIP-85 Trust Scores signal
     if (contact.trustScores && contact.trustScores.length > 0) {
-      score += contact.trustScores.length * 10;
+      score += contact.trustScores.length * 20;
       const avgScore = contact.trustScores.reduce((acc, r) => acc + r.score, 0) / contact.trustScores.length;
-      if (avgScore > 0.8) score += 30;
-      else if (avgScore > 0.5) score += 15;
+      if (avgScore > 0.8) score += 100;
+      else if (avgScore > 0.5) score += 50;
     }
     
     return score;
   };
 
+  const cancelSearch = () => {
+    if (searchAbortController) {
+      searchAbortController.abort();
+      setSearchAbortController(null);
+    }
+    setIsSearching(false);
+    showToast("Search cancelled", "info");
+  };
+
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
-    setIsSyncing(true);
+    
+    // Abort previous search if any
+    if (searchAbortController) {
+      searchAbortController.abort();
+    }
+    
+    const controller = new AbortController();
+    setSearchAbortController(controller);
+    setIsSearching(true);
     setSearchResults([]);
     
+    const seenPubkeys = new Set<string>();
+
+    const updateResults = (newContacts: Contact[]) => {
+      setSearchResults(prev => {
+        const combined = [...prev];
+        newContacts.forEach(c => {
+          if (!seenPubkeys.has(c.pubkey)) {
+            combined.push(c);
+            seenPubkeys.add(c.pubkey);
+          } else {
+            // Update existing result if it has more info (like trust scores or WoT info)
+            const idx = combined.findIndex(item => item.pubkey === c.pubkey);
+            if (idx !== -1) {
+              combined[idx] = { ...combined[idx], ...c };
+            }
+          }
+        });
+        return combined.sort((a, b) => scoreProfile(b) - scoreProfile(a));
+      });
+    };
+
     try {
       const query = searchQuery.trim();
       const queryLower = query.toLowerCase();
@@ -2203,9 +2385,28 @@ export default function App() {
       let targetPk: string | null = null;
       if (isNip05) {
         try {
-          const profile = await nip05.queryProfile(query);
-          if (profile) targetPk = profile.pubkey;
-        } catch (e) { console.warn("NIP-05 resolution failed", e); }
+          // nip05.queryProfile doesn't natively support AbortSignal in all versions, 
+          // but we can wrap it or just check signal after.
+          const res = await nip05.queryProfile(query);
+          if (controller.signal.aborted) return;
+          
+          if (res) {
+            targetPk = res.pubkey;
+            const profileRelays = res.relays || [];
+            const fetchRelays = [...new Set([...DEFAULT_RELAYS, ...SEARCH_RELAYS, ...profileRelays])];
+            const p = await fetchProfile(targetPk, true, fetchRelays, controller.signal);
+            const r = await fetchTrustScores(targetPk, controller.signal);
+            if (p && !controller.signal.aborted) {
+              updateResults([{ pubkey: targetPk, profile: p, trustScores: r }]);
+              setIsSearching(false);
+              setSearchAbortController(null);
+              return;
+            }
+          }
+        } catch (e) { 
+          if (e instanceof Error && e.name === 'AbortError') return;
+          console.warn("NIP-05 resolution failed", e); 
+        }
       } else if (query.startsWith('npub1')) {
         try {
           const decoded = nip19.decode(query) as any;
@@ -2215,140 +2416,184 @@ export default function App() {
         targetPk = query;
       }
 
-      if (targetPk) {
-        const p = await fetchProfile(targetPk, false, [...DEFAULT_RELAYS, ...SEARCH_RELAYS]);
-        const r = await fetchTrustScores(targetPk);
-        if (p) {
-          setSearchResults([{ pubkey: targetPk, profile: p, trustScores: r }]);
-          setIsSyncing(false);
-          return;
+      if (targetPk && !isNip05 && !query.startsWith('npub1') && !controller.signal.aborted) {
+        const p = await fetchProfile(targetPk, false, [...DEFAULT_RELAYS, ...SEARCH_RELAYS], controller.signal);
+        const r = await fetchTrustScores(targetPk, controller.signal);
+        if (p && !controller.signal.aborted) {
+          updateResults([{ pubkey: targetPk, profile: p, trustScores: r }]);
         }
       }
 
-      // 2. Comprehensive Search: Local Contacts + WoT
-      const allMatches: Contact[] = [];
-      const seenPubkeys = new Set<string>();
+      if (controller.signal.aborted) return;
 
-      // Add local matches
-      contacts.forEach(c => {
-        const name = (c.profile?.display_name || c.profile?.name || '').toLowerCase();
-        const petname = (c.petname || '').toLowerCase();
-        const nip05Val = (c.profile?.nip05 || '').toLowerCase();
-        if (name.includes(queryLower) || petname.includes(queryLower) || nip05Val.includes(queryLower)) {
-          allMatches.push({ ...c, isWoT: wotPubkeys.includes(c.pubkey), followedBy: wotFollowMap[c.pubkey] });
-          seenPubkeys.add(c.pubkey);
-        }
+      // 2. Local Search (Instant)
+      const fuseOptions = {
+        keys: [
+          { name: 'profile.name', weight: 1.0 },
+          { name: 'profile.display_name', weight: 1.0 },
+          { name: 'profile.nip05', weight: 0.8 },
+          { name: 'petname', weight: 1.2 },
+          { name: 'pubkey', weight: 0.5 }
+        ],
+        threshold: 0.35,
+        distance: 100,
+        ignoreLocation: true,
+        useExtendedSearch: true,
+        findAllMatches: true
+      };
+
+      const localFuse = new Fuse(contacts, fuseOptions);
+      const localResults = localFuse.search(query);
+      const localMatches = localResults.map(res => {
+        const c = res.item as Contact;
+        return { ...c, isWoT: wotPubkeys.includes(c.pubkey), followedBy: wotFollowMap[c.pubkey] };
       });
+      updateResults(localMatches);
 
-      // 3. WoT Search (Degrees of Separation)
-      const { secondDegree: secondDegreePubkeys, followMap: currentFollowMap } = await getWoTPubkeys();
-      setWotPubkeys(secondDegreePubkeys);
-      setWotFollowMap(currentFollowMap);
-      
-      const combinedWoT = secondDegreePubkeys.filter(pk => !seenPubkeys.has(pk));
-      
-      if (combinedWoT.length > 0) {
-        const batchSize = 50;
-        const limit = 200;
-        
-        for (let i = 0; i < Math.min(combinedWoT.length, limit); i += batchSize) {
-          const batch = combinedWoT.slice(i, i + batchSize);
-          const [events, reviewsEvents] = await Promise.all([
-            pool.current.querySync(DEFAULT_RELAYS, { kinds: [0], authors: batch }),
-            pool.current.querySync(DEFAULT_RELAYS, { kinds: [KIND_REVIEW], '#p': batch })
+      if (controller.signal.aborted) return;
+
+      // 3. Global Relay Search (NIP-50)
+      const globalSearchPromise = (async () => {
+        try {
+          const searchEvents = await Promise.race([
+            pool.current.querySync(SEARCH_RELAYS, {
+              kinds: [0],
+              search: query,
+              limit: 50
+            }),
+            new Promise<Event[]>((_, reject) => {
+              const timeoutId = setTimeout(() => reject(new Error('Search timeout')), 10000);
+              controller.signal.addEventListener('abort', () => {
+                clearTimeout(timeoutId);
+                reject(new Error('AbortError'));
+              });
+            })
           ]);
           
-          const localTrustScoresMap: Record<string, NostrTrustScore[]> = {};
-          reviewsEvents.forEach(ev => {
-            const pTag = ev.tags.find(t => t[0] === 'p');
-            if (pTag) {
-              const target = pTag[1];
-              if (!localTrustScoresMap[target]) localTrustScoresMap[target] = [];
-              const r = parseTrustScore(ev);
-              if (r) localTrustScoresMap[target].push(r);
-            }
-          });
-          
-          events.forEach(ev => {
-            if (seenPubkeys.has(ev.pubkey)) return;
+          if (controller.signal.aborted) return;
+
+          const newResults: Contact[] = [];
+          for (const ev of searchEvents) {
             try {
-              const p = JSON.parse(ev.content);
-              const name = (p.display_name || p.name || '').toLowerCase();
-              const nip05Val = (p.nip05 || '').toLowerCase();
-              if (name.includes(queryLower) || nip05Val.includes(queryLower)) {
-                allMatches.push({ 
-                  pubkey: ev.pubkey, 
-                  profile: p, 
-                  isWoT: true,
-                  isPriority: priorityPubkeys.includes(ev.pubkey),
-                  followedBy: currentFollowMap[ev.pubkey],
-                  trustScores: localTrustScoresMap[ev.pubkey] || []
-                });
-                seenPubkeys.add(ev.pubkey);
-              }
-            } catch {}
-          });
-        }
-      }
-
-      if (allMatches.length > 0) {
-        setSearchResults(allMatches.sort((a, b) => scoreProfile(b) - scoreProfile(a)));
-        setIsSyncing(false);
-        // If we have a good number of trusted results, we can stop here
-        if (allMatches.length >= 5) return;
-      }
-
-      // 4. Relay Search (NIP-50) - Fallback to "Beefier" Relays
-      const relayResults = await searchOnRelays(SEARCH_RELAYS, query, 20);
-      const newRelayResults = relayResults.filter(r => !seenPubkeys.has(r.pubkey));
-      
-      if (newRelayResults.length > 0) {
-        const combined = [...allMatches, ...newRelayResults]
-          .filter(r => r.profile && (r.profile.name || r.profile.display_name || r.profile.picture))
-          .sort((a, b) => scoreProfile(b) - scoreProfile(a));
+              const profile = JSON.parse(ev.content);
+              newResults.push({
+                pubkey: ev.pubkey,
+                profile,
+                isWoT: wotPubkeys.includes(ev.pubkey),
+                followedBy: wotFollowMap[ev.pubkey]
+              });
+            } catch (e) {}
+          }
           
-        if (combined.length > 0) {
-          setSearchResults(combined);
-          setIsSyncing(false);
-          return;
+          if (newResults.length > 0 && !controller.signal.aborted) {
+            updateResults(newResults);
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message === 'AbortError') return;
+          console.warn("Global search failed or timed out", e);
         }
-      }
+      })();
 
-      // 5. Final Fallback: Search inbox relays of conversation partners
-      const partnerInboxRelays = await getInboxRelaysOfPartners();
-      if (partnerInboxRelays.length > 0) {
-        const results = await searchOnRelays(partnerInboxRelays, query, 10);
-        if (results.length > 0) {
-          setSearchResults(results.sort((a, b) => scoreProfile(b) - scoreProfile(a)));
-          setIsSyncing(false);
-          return;
+      // 4. WoT Search (Parallel)
+      const wotSearchPromise = (async () => {
+        try {
+          const { secondDegree: secondDegreePubkeys, followMap: currentFollowMap } = await getWoTPubkeys(controller.signal);
+          if (controller.signal.aborted) return;
+          
+          const combinedWoT = secondDegreePubkeys.filter(pk => !seenPubkeys.has(pk));
+          if (combinedWoT.length === 0) return;
+
+          const batchSize = 50;
+          const limit = 200;
+          
+          for (let i = 0; i < Math.min(combinedWoT.length, limit); i += batchSize) {
+            if (controller.signal.aborted) break;
+            const batch = combinedWoT.slice(i, i + batchSize);
+            
+            const events = await Promise.race([
+              pool.current.querySync(SEARCH_RELAYS, {
+                kinds: [0],
+                authors: batch,
+                limit: batch.length
+              }),
+              new Promise<Event[]>((_, reject) => {
+                const timeoutId = setTimeout(() => reject(new Error('WoT batch timeout')), 8000);
+                controller.signal.addEventListener('abort', () => {
+                  clearTimeout(timeoutId);
+                  reject(new Error('AbortError'));
+                });
+              })
+            ]);
+
+            if (controller.signal.aborted) break;
+
+            const wotResults: Contact[] = [];
+            for (const ev of events) {
+              try {
+                const profile = JSON.parse(ev.content);
+                const name = (profile.name || profile.display_name || '').toLowerCase();
+                const nip05Str = (profile.nip05 || '').toLowerCase();
+                
+                if (name.includes(queryLower) || nip05Str.includes(queryLower) || ev.pubkey.includes(queryLower)) {
+                  wotResults.push({
+                    pubkey: ev.pubkey,
+                    profile,
+                    isWoT: true,
+                    followedBy: currentFollowMap[ev.pubkey]
+                  });
+                }
+              } catch (e) {}
+            }
+            
+            if (wotResults.length > 0 && !controller.signal.aborted) {
+              updateResults(wotResults);
+            }
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message === 'AbortError') return;
+          console.warn("WoT search failed", e);
         }
-      }
+      })();
 
-      showToast("No verified or high-quality results found", "info");
+      await Promise.all([globalSearchPromise, wotSearchPromise]);
+
+      if (seenPubkeys.size === 0 && !controller.signal.aborted) {
+        showToast("No results found on relays", "info");
+      }
     } catch (err) {
-      console.error('Search failed:', err);
-      showToast("Search failed", "error");
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log("Search aborted");
+      } else {
+        console.error("Search error", err);
+        showToast("Search failed", "error");
+      }
     } finally {
-      setIsSyncing(false);
+      if (!controller.signal.aborted) {
+        setIsSearching(false);
+        setSearchAbortController(null);
+      }
     }
   };
 
-  const filteredContacts = contacts.filter(c => {
-    if (!searchQuery.trim()) return true;
-    const name = (c.profile?.display_name || c.profile?.name || '').toLowerCase();
-    const nip05 = (c.profile?.nip05 || '').toLowerCase();
-    const query = searchQuery.toLowerCase();
-    return name.includes(query) || nip05.includes(query) || c.pubkey.toLowerCase().includes(query);
-  });
+  const filteredContacts = useMemo(() => {
+    if (!searchQuery.trim()) return contacts;
+    const fuse = new Fuse(contacts, {
+      keys: ['profile.name', 'profile.display_name', 'profile.nip05', 'petname', 'pubkey'],
+      threshold: 0.3,
+      ignoreLocation: true
+    });
+    return fuse.search(searchQuery).map(res => res.item as Contact);
+  }, [contacts, searchQuery]);
 
-  const filteredConversations = conversations.filter(c => {
-    if (!searchQuery.trim()) return true;
-    const name = (c.profile?.display_name || c.profile?.name || '').toLowerCase();
-    const nip05 = (c.profile?.nip05 || '').toLowerCase();
-    const query = searchQuery.toLowerCase();
-    return name.includes(query) || nip05.includes(query) || c.pubkey.toLowerCase().includes(query) || c.lastMessage.content.toLowerCase().includes(query);
-  });
+  const filteredConversations = useMemo(() => {
+    if (!searchQuery.trim()) return conversations;
+    const fuse = new Fuse(conversations, {
+      keys: ['profile.name', 'profile.display_name', 'profile.nip05', 'pubkey', 'lastMessage.content'],
+      threshold: 0.3,
+      ignoreLocation: true
+    });
+    return fuse.search(searchQuery).map(res => res.item as Conversation);
+  }, [conversations, searchQuery]);
 
   // --- Render ---
 
@@ -2409,7 +2654,7 @@ export default function App() {
           {showKeyInput && (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowKeyInput(false)} className="absolute inset-0 bg-black/80 dark:bg-black/90 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl">
+              <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="relative w-full max-w-sm max-h-[90vh] bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800">
                 <div className="space-y-1">
                   <h3 className="text-xl font-bold">Login</h3>
                   <p className="text-xs text-zinc-500">Enter your nsec or hex private key</p>
@@ -2419,7 +2664,7 @@ export default function App() {
                   placeholder="nsec1... or hex" 
                   value={keyInput} 
                   onChange={(e) => setKeyInput(e.target.value)} 
-                  className="w-full bg-zinc-50 dark:bg-black border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-4 text-sm focus:outline-none focus:border-black dark:focus:border-white transition-colors" 
+                  className="w-full bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-4 text-sm focus:outline-none focus:border-black dark:focus:border-white transition-colors slanted-box" 
                 />
                 <button 
                   onClick={() => {
@@ -2441,7 +2686,7 @@ export default function App() {
           {showBunkerInput && (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowBunkerInput(false)} className="absolute inset-0 bg-black/80 dark:bg-black/90 backdrop-blur-sm" />
-              <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl">
+              <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="relative w-full max-w-sm max-h-[90vh] bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800">
                 <div className="space-y-1">
                   <h3 className="text-xl font-bold">Nostr Connect</h3>
                   <p className="text-xs text-zinc-500">Enter your Bunker URI (bunker://...)</p>
@@ -2451,7 +2696,7 @@ export default function App() {
                   placeholder="bunker://..." 
                   value={bunkerUri} 
                   onChange={(e) => setBunkerUri(e.target.value)} 
-                  className="w-full bg-zinc-50 dark:bg-black border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-4 text-sm focus:outline-none focus:border-black dark:focus:border-white transition-colors" 
+                  className="w-full bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-4 text-sm focus:outline-none focus:border-black dark:focus:border-white transition-colors slanted-box" 
                 />
                 <button 
                   onClick={loginNip46} 
@@ -2521,18 +2766,44 @@ export default function App() {
 
         {/* Search Bar */}
         <div className="p-4 border-b border-zinc-200 dark:border-zinc-900 bg-zinc-50/30 dark:bg-zinc-950/30">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 dark:text-zinc-500" />
-            <input 
-              type="text" 
-              placeholder={sidebarTab === 'contacts' ? "Search contacts or npub..." : sidebarTab === 'priority' ? "Search priority or npub..." : "Search messages..."} 
-              value={searchQuery} 
-              onChange={(e) => setSearchQuery(e.target.value)} 
-              onKeyDown={(e) => e.key === 'Enter' && handleSearch()} 
-              className="w-full pl-10 pr-4 py-3 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-900 rounded-none text-sm focus:outline-none focus:border-emerald-500 transition-colors" 
-            />
-            {isSyncing && <Loader2 size={12} className="absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-emerald-500" />}
-          </div>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 dark:text-zinc-500" />
+              <input 
+                type="text" 
+                placeholder={sidebarTab === 'contacts' ? "Search contacts or npub..." : sidebarTab === 'priority' ? "Search priority or npub..." : "Search messages..."} 
+                value={searchQuery} 
+                onChange={(e) => setSearchQuery(e.target.value)} 
+                onKeyDown={(e) => e.key === 'Enter' && handleSearch()} 
+                className="w-full pl-10 pr-10 py-3 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none text-sm focus:outline-none focus:border-emerald-500 transition-colors slanted-box" 
+              />
+              {isSearching ? (
+                <button 
+                  onClick={cancelSearch}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-zinc-400 hover:text-red-500 transition-colors"
+                  title="Cancel Search"
+                >
+                  <Loader2 size={14} className="animate-spin" />
+                </button>
+              ) : searchQuery && (
+                <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                  {sidebarTab === 'contacts' && (
+                    <button 
+                      onClick={handleSearch}
+                      className="p-1 text-emerald-500 hover:text-emerald-600 transition-colors"
+                      title="Search on Relays"
+                    >
+                      <Zap size={14} />
+                    </button>
+                  )}
+                  <button 
+                    onClick={() => { setSearchQuery(''); setSearchResults([]); }}
+                    className="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+            </div>
         </div>
 
         {/* Sidebar Content */}
@@ -2834,29 +3105,43 @@ export default function App() {
                       value={newMessage} 
                       onChange={(e) => setNewMessage(e.target.value)} 
                       onKeyDown={(e) => e.key === 'Enter' && sendMessage()} 
-                      className="flex-1 px-6 py-4 bg-zinc-50 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none focus:outline-none focus:border-emerald-500 transition-colors" 
+                      className="flex-1 px-6 py-4 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none focus:outline-none focus:border-emerald-500 transition-colors slanted-box" 
                     />
                   )}
 
-                  <input 
-                    type="file" 
-                    id="image-upload" 
-                    className="hidden" 
-                    accept="image/*" 
-                    onChange={async (e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      setIsUploading(true);
-                      try {
-                        const url = await uploadToBlossom(file);
-                        await sendMessage(url, 'image', undefined, file.type);
-                      } catch (err) {
-                        alert("Failed to upload image: " + (err instanceof Error ? err.message : String(err)));
-                      } finally {
-                        setIsUploading(false);
-                      }
-                    }}
-                  />
+                  <div className="flex items-center gap-2">
+                    <input 
+                      type="file" 
+                      id="image-upload" 
+                      className="hidden" 
+                      accept="image/*" 
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setIsUploading(true);
+                        try {
+                          const url = await uploadToBlossom(file);
+                          await sendMessage(url, 'image', undefined, file.type);
+                        } catch (err) {
+                          alert("Failed to upload image: " + (err instanceof Error ? err.message : String(err)));
+                        } finally {
+                          setIsUploading(false);
+                        }
+                      }}
+                    />
+                    {isUploading && (
+                      <div className="flex items-center gap-2 px-2">
+                        <div className="w-20 h-1.5 bg-zinc-200 dark:bg-zinc-800 rounded-full overflow-hidden">
+                          <motion.div 
+                            className="h-full bg-emerald-500"
+                            initial={{ width: 0 }}
+                            animate={{ width: `${uploadProgress}%` }}
+                          />
+                        </div>
+                        <span className="text-[10px] text-zinc-500 font-mono">{uploadProgress}%</span>
+                      </div>
+                    )}
+                  </div>
 
                   {userBlossomServers.length > 0 && (
                     <div className="relative z-50">
@@ -2873,7 +3158,7 @@ export default function App() {
                           <div className="absolute top-full left-0 mt-2 z-50">
                             <div className="bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-2xl p-2 min-w-[200px] space-y-1">
                               <p className="text-[8px] font-bold text-zinc-400 uppercase tracking-widest px-2 pb-1 border-b border-zinc-100 dark:border-zinc-900">Media Server</p>
-                              {userBlossomServers.map(server => {
+                              {(userBlossomServers.length > 0 ? userBlossomServers : DEFAULT_BLOSSOM_SERVERS).map(server => {
                                 const isPreferred = preferredBlossomServer && 
                                   (server.endsWith('/') ? server.slice(0, -1) : server) === 
                                   (preferredBlossomServer.endsWith('/') ? preferredBlossomServer.slice(0, -1) : preferredBlossomServer);
@@ -2962,7 +3247,7 @@ export default function App() {
                 .map(msg => (
                 <div key={msg.id} className={`flex flex-col ${msg.isSelf ? 'items-end' : 'items-start'}`}>
                   <div 
-                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed ${msg.isSelf ? 'bg-gradient-to-br from-emerald-500 via-emerald-600 to-blue-600 text-white shadow-lg shadow-emerald-500/20' : 'bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 text-black dark:text-white border border-zinc-200 dark:border-zinc-800'}`}
+                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed slanted-box ${msg.isSelf ? 'bg-gradient-to-br from-zinc-800 via-zinc-900 to-black text-white shadow-lg shadow-black/20' : 'bg-gradient-to-br from-white via-zinc-100 to-zinc-200 dark:from-zinc-900 dark:to-zinc-950 text-black dark:text-white border border-zinc-200 dark:border-zinc-800'}`}
                   >
                     {msg.type === 'image' ? (
                       <div className="space-y-2">
@@ -3002,7 +3287,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl"
+              className="relative w-full max-w-sm max-h-[90vh] bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 p-8 rounded-none space-y-6 shadow-2xl overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800"
             >
               <div className="space-y-1">
                 <h3 className="text-xl font-bold uppercase tracking-tighter">Assign Trust Score</h3>
@@ -3035,7 +3320,7 @@ export default function App() {
                     value={trustScoreContext}
                     onChange={(e) => setTrustScoreContext(e.target.value)}
                     placeholder="Why do you trust (or distrust) this user?"
-                    className="w-full h-32 bg-zinc-50 dark:bg-black border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 transition-colors resize-none"
+                    className="w-full h-32 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 transition-colors resize-none slanted-box"
                   />
                 </div>
               </div>
@@ -3072,7 +3357,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-sm bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 shadow-2xl overflow-hidden"
+              className="relative w-full max-w-sm max-h-[90vh] bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 shadow-2xl overflow-y-auto scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800"
             >
               {/* Profile Background/Header */}
               <div className="h-24 bg-zinc-100 dark:bg-zinc-900 relative">
@@ -3143,7 +3428,7 @@ export default function App() {
                               value={petnameInput}
                               onChange={(e) => setPetnameInput(e.target.value)}
                               placeholder="Assign petname..."
-                              className="flex-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 px-3 py-2 text-xs font-medium focus:outline-none focus:border-emerald-500"
+                              className="flex-1 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-800 px-3 py-2 text-xs font-medium focus:outline-none focus:border-emerald-500 slanted-box"
                               autoFocus
                             />
                             <button 
@@ -3192,33 +3477,48 @@ export default function App() {
                       </div>
                     )}
 
-                    {viewingRelays.length > 0 && (
-                      <div className="mt-6 space-y-2">
-                        <div className="flex items-center justify-between">
-                          <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">DM Relays</p>
-                          {isViewingDefaultRelays && (
-                            <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default fallback</span>
-                          )}
+                      {viewingRelays.length > 0 && (
+                        <div className="mt-6 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">DM Relays</p>
+                            {isViewingDefaultRelays && (
+                              <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default fallback</span>
+                            )}
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {viewingRelays.map(url => {
+                              const info = relayInfoCache[url];
+                              const discovery = relayDiscovery[url.replace('wss://', '').replace('ws://', '')];
+                              return (
+                                <div key={url} className="flex items-center gap-2 px-2 py-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none group relative cursor-help" title={url}>
+                                  {info?.icon ? (
+                                    <img src={info.icon} alt="" className="w-3 h-3 object-contain shrink-0" />
+                                  ) : (
+                                    <Zap size={10} className={discovery ? 'text-emerald-500' : 'text-zinc-400'} />
+                                  )}
+                                  <span className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400 truncate max-w-[100px]">
+                                    {info?.name || url.replace('wss://', '').replace('ws://', '')}
+                                  </span>
+                                  {discovery && (
+                                    <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50 w-48 p-3 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-xl text-[9px] space-y-1">
+                                      <p className="font-bold uppercase tracking-widest border-b border-zinc-100 dark:border-zinc-900 pb-1 mb-1">Relay Discovery (NIP-66)</p>
+                                      <div className="flex justify-between"><span>Software:</span> <span className="font-mono">{discovery.software}</span></div>
+                                      <div className="flex justify-between"><span>Version:</span> <span className="font-mono">{discovery.version}</span></div>
+                                      {discovery.supported_nips && (
+                                        <div className="flex flex-wrap gap-1 mt-1">
+                                          {discovery.supported_nips.slice(0, 5).map((n: number) => (
+                                            <span key={n} className="px-1 bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">NIP-{n}</span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
-                        <div className="flex flex-wrap gap-2">
-                          {viewingRelays.map(url => {
-                            const info = relayInfoCache[url];
-                            return (
-                              <div key={url} className="flex items-center gap-2 px-2 py-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none group relative cursor-help" title={url}>
-                                {info?.icon ? (
-                                  <img src={info.icon} alt="" className="w-3 h-3 object-contain shrink-0" />
-                                ) : (
-                                  <Zap size={10} className="text-zinc-400" />
-                                )}
-                                <span className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400 truncate max-w-[100px]">
-                                  {info?.name || url.replace('wss://', '').replace('ws://', '')}
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
+                      )}
 
                     {/* Trust Scores Section */}
                     <div className="mt-8 space-y-4">
@@ -3391,164 +3691,248 @@ export default function App() {
         {showSettings && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowSettings(false)} className="absolute inset-0 bg-black/80 dark:bg-black/90 backdrop-blur-sm" />
-            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative w-full max-w-md bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none p-8 space-y-8 overflow-y-auto max-h-[90vh] shadow-2xl">
+            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} className="relative w-full max-w-2xl bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-900 rounded-none p-8 space-y-8 overflow-y-auto max-h-[90vh] shadow-2xl">
               <div className="flex justify-between items-center">
-                <h3 className="text-2xl font-bold">Settings</h3>
+                <div className="flex items-center gap-6">
+                  <h3 className="text-2xl font-bold">Settings</h3>
+                  <div className="flex gap-4">
+                    {(['general', 'relays', 'blossom'] as const).map(tab => (
+                      <button 
+                        key={tab}
+                        onClick={() => setSettingsTab(tab)}
+                        className={`text-[10px] font-bold uppercase tracking-widest pb-1 border-b-2 transition-all ${settingsTab === tab ? 'border-emerald-500 text-emerald-500' : 'border-transparent text-zinc-400 hover:text-zinc-600'}`}
+                      >
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <button onClick={() => setShowSettings(false)} className="p-2 text-zinc-400 dark:text-zinc-500 hover:text-black dark:hover:text-white"><X size={24} /></button>
               </div>
 
               <div className="space-y-8">
-                <div className="space-y-4">
-                  <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Identity</p>
-                  <div className="p-4 bg-zinc-50 dark:bg-zinc-900 rounded-none border border-zinc-200 dark:border-zinc-800 space-y-3">
-                    <div className="flex items-center gap-3">
-                      <HexagonAvatar 
-                        src={profile?.picture} 
-                        size={48} 
-                      />
-                      <div className="min-w-0">
-                        <p className="font-bold truncate">{profile?.display_name || profile?.name || 'Anonymous'}</p>
-                        <p className="text-[10px] text-zinc-500 font-mono truncate">{formatNpub(pubKey)}</p>
+                {settingsTab === 'general' && (
+                  <>
+                    <div className="space-y-4">
+                      <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Identity</p>
+                      <div className="p-4 bg-zinc-50 dark:bg-zinc-900 rounded-none border border-zinc-200 dark:border-zinc-800 space-y-3">
+                        <div className="flex items-center gap-3">
+                          <HexagonAvatar 
+                            src={profile?.picture} 
+                            size={48} 
+                          />
+                          <div className="min-w-0">
+                            <p className="font-bold truncate">{profile?.display_name || profile?.name || 'Anonymous'}</p>
+                            <p className="text-[10px] text-zinc-500 font-mono truncate">{formatNpub(pubKey)}</p>
+                          </div>
+                        </div>
+                        <button 
+                          onClick={() => { navigator.clipboard.writeText(formatNpub(pubKey)); alert("Copied npub"); }}
+                          className="w-full py-2 bg-white dark:bg-black text-xs font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors flex items-center justify-center gap-2"
+                        >
+                          <Copy size={14} className="text-blue-500" /> Copy npub
+                        </button>
                       </div>
                     </div>
-                    <button 
-                      onClick={() => { navigator.clipboard.writeText(formatNpub(pubKey)); alert("Copied npub"); }}
-                      className="w-full py-2 bg-white dark:bg-black text-xs font-bold rounded-none border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors flex items-center justify-center gap-2"
-                    >
-                      <Copy size={14} className="text-blue-500" /> Copy npub
-                    </button>
-                  </div>
-                </div>
 
-                <div className="space-y-4">
-                  <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Appearance</p>
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-zinc-400">Theme</span>
-                      <div className="flex bg-zinc-100 dark:bg-zinc-900 p-1 rounded-none border border-zinc-200 dark:border-zinc-800">
+                    <div className="space-y-4">
+                      <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Appearance</p>
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-400">Theme</span>
+                          <div className="flex bg-zinc-100 dark:bg-zinc-900 p-1 rounded-none border border-zinc-200 dark:border-zinc-800">
+                            <button 
+                              onClick={() => setTheme('light')} 
+                              className={`p-2 transition-all ${theme === 'light' ? 'bg-white text-black shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}
+                            >
+                              <Sun size={14} />
+                            </button>
+                            <button 
+                              onClick={() => setTheme('dark')} 
+                              className={`p-2 transition-all ${theme === 'dark' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-400'}`}
+                            >
+                              <Moon size={14} />
+                            </button>
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-400">Text Size</span>
+                          <div className="flex bg-zinc-100 dark:bg-zinc-900 p-1 rounded-none border border-zinc-200 dark:border-zinc-800">
+                            {fontSizes.map(size => (
+                              <button 
+                                key={size}
+                                onClick={() => setFontSize(size)}
+                                className={`px-3 py-1 text-[10px] font-bold transition-all ${fontSize === size ? 'bg-white dark:bg-zinc-800 text-black dark:text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}
+                              >
+                                {size === 12 ? 'S' : size === 14 ? 'M' : size === 16 ? 'L' : 'XL'}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-400">Font Family</span>
+                          <select 
+                            value={fontFamily} 
+                            onChange={(e) => setFontFamily(e.target.value)}
+                            className="bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-1 text-xs focus:outline-none"
+                          >
+                            <option value="sans">Inter (Sans)</option>
+                            <option value="mono">JetBrains Mono</option>
+                            <option value="serif">Playfair Display (Serif)</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Preferences</p>
+                      
+                      <div className="flex items-center justify-between">
+                        <div className="space-y-0.5">
+                          <p className="text-xs text-zinc-400">Send Delay (10s)</p>
+                          <p className="text-[8px] text-zinc-500 uppercase tracking-tighter">Undo window for sent messages</p>
+                        </div>
                         <button 
-                          onClick={() => setTheme('light')} 
-                          className={`p-2 transition-all ${theme === 'light' ? 'bg-white text-black shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}
+                          onClick={() => {
+                            const next = !sendDelayEnabled;
+                            setSendDelayEnabled(next);
+                            localStorage.setItem('pam_send_delay', String(next));
+                          }}
+                          className={`w-10 h-5 rounded-none transition-colors relative ${sendDelayEnabled ? 'bg-emerald-500' : 'bg-zinc-200 dark:bg-zinc-800'}`}
                         >
-                          <Sun size={14} />
+                          <div className={`absolute top-1 w-3 h-3 rounded-none transition-all ${sendDelayEnabled ? 'right-1 bg-white' : 'left-1 bg-zinc-400 dark:bg-zinc-600'}`} />
                         </button>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-zinc-400">Enable Desktop Notifications</span>
                         <button 
-                          onClick={() => setTheme('dark')} 
-                          className={`p-2 transition-all ${theme === 'dark' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-400'}`}
+                          onClick={() => {
+                            if (!notificationsEnabled) {
+                              Notification.requestPermission().then(p => {
+                                if (p === 'granted') {
+                                  setNotificationsEnabled(true);
+                                  localStorage.setItem('pam_notifications', 'true');
+                                }
+                              });
+                            } else {
+                              setNotificationsEnabled(false);
+                              localStorage.setItem('pam_notifications', 'false');
+                            }
+                          }}
+                          className={`w-10 h-5 rounded-none transition-colors relative ${notificationsEnabled ? 'bg-emerald-500' : 'bg-zinc-200 dark:bg-zinc-800'}`}
                         >
-                          <Moon size={14} />
+                          <div className={`absolute top-1 w-3 h-3 rounded-none transition-all ${notificationsEnabled ? 'right-1 bg-white' : 'left-1 bg-zinc-400 dark:bg-zinc-600'}`} />
                         </button>
                       </div>
                     </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-zinc-400">Text Size</span>
-                      <div className="flex bg-zinc-100 dark:bg-zinc-900 p-1 rounded-none border border-zinc-200 dark:border-zinc-800">
-                        {fontSizes.map(size => (
+
+                    <div className="pt-4 space-y-3">
+                      <button 
+                        onClick={() => setShowLogoutWarning(true)}
+                        className="w-full py-4 bg-red-500/10 text-red-500 font-bold rounded-none border border-red-500/20 hover:bg-red-500/20 transition-colors flex items-center justify-center gap-2"
+                      >
+                        <RotateCcw size={18} /> Logout
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {settingsTab === 'relays' && (
+                  <div className="space-y-8">
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">My DM Relays</p>
+                        {userDmRelays.every(url => DEFAULT_RELAYS.includes(url)) && (
+                          <span className="text-[8px] font-bold text-amber-500 uppercase tracking-tighter animate-pulse">Add custom relays for better privacy</span>
+                        )}
+                      </div>
+                      <div className="space-y-3">
+                        <div className="flex gap-2">
+                          <input 
+                            type="text" 
+                            value={newRelayUrl}
+                            onChange={(e) => setNewRelayUrl(e.target.value)}
+                            placeholder="wss://relay.example.com"
+                            className="flex-1 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors slanted-box"
+                            onKeyDown={(e) => e.key === 'Enter' && addRelay()}
+                          />
                           <button 
-                            key={size}
-                            onClick={() => setFontSize(size)}
-                            className={`px-3 py-1 text-[10px] font-bold transition-all ${fontSize === size ? 'bg-white dark:bg-zinc-800 text-black dark:text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}
+                            onClick={addRelay}
+                            className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
                           >
-                            {size === 12 ? 'S' : size === 14 ? 'M' : size === 16 ? 'L' : 'XL'}
+                            Add
                           </button>
+                        </div>
+
+                        <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
+                          {userDmRelays.map(url => {
+                            const info = relayInfoCache[url];
+                            const isDefault = DEFAULT_RELAYS.includes(url);
+                            return (
+                              <div key={url} className="flex items-center justify-between p-2 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 group">
+                                <div className="flex items-center gap-3 min-w-0">
+                                  <div className="w-6 h-6 shrink-0 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 flex items-center justify-center overflow-hidden">
+                                    {info?.icon ? (
+                                      <img src={info.icon} alt="" className="w-full h-full object-contain" />
+                                    ) : (
+                                      <Zap size={10} className="text-zinc-400" />
+                                    )}
+                                  </div>
+                                  <div className="min-w-0">
+                                    <p className="text-[10px] font-bold truncate">{info?.name || url.replace('wss://', '').replace('ws://', '')}</p>
+                                    <p className="text-[8px] text-zinc-500 font-mono truncate">{url}</p>
+                                  </div>
+                                  {isDefault && <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default</span>}
+                                </div>
+                                <button onClick={() => removeRelay(url)} className="p-2 text-zinc-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={14} /></button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Relay Discovery (NIP-66)</p>
+                        <button onClick={fetchRelayDiscovery} className="text-[9px] font-bold text-emerald-500 uppercase tracking-tighter hover:underline">Refresh</button>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-64 overflow-y-auto pr-1 custom-scrollbar">
+                        {Object.entries(relayDiscovery).map(([url, data]: [string, any]) => (
+                          <div key={url} className="p-3 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-bold truncate max-w-[140px]">{url}</span>
+                              <button 
+                                onClick={() => {
+                                  const fullUrl = `wss://${url}`;
+                                  if (!userDmRelays.includes(fullUrl)) {
+                                    setUserDmRelays(prev => [...prev, fullUrl]);
+                                    localStorage.setItem('pam_dm_relays', JSON.stringify([...userDmRelays, fullUrl]));
+                                    showToast(`Added ${url}`, "success");
+                                  }
+                                }}
+                                className="p-1 text-emerald-500 hover:bg-emerald-500/10 transition-colors"
+                              >
+                                <Plus size={14} />
+                              </button>
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              <span className="text-[8px] px-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 font-mono uppercase">{data.software} {data.version}</span>
+                              {data.supported_nips?.includes(42) && <span className="text-[8px] px-1 bg-blue-500/10 text-blue-500 font-bold uppercase tracking-tighter">Auth</span>}
+                              {data.supported_nips?.includes(44) && <span className="text-[8px] px-1 bg-emerald-500/10 text-emerald-500 font-bold uppercase tracking-tighter">NIP-44</span>}
+                            </div>
+                          </div>
                         ))}
                       </div>
                     </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-zinc-400">Font Family</span>
-                      <select 
-                        value={fontFamily} 
-                        onChange={(e) => setFontFamily(e.target.value)}
-                        className="bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-1 text-xs focus:outline-none"
-                      >
-                        <option value="sans">Inter (Sans)</option>
-                        <option value="mono">JetBrains Mono</option>
-                        <option value="serif">Playfair Display (Serif)</option>
-                      </select>
-                    </div>
                   </div>
-                </div>
+                )}
 
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">DM Relays</p>
-                    {userDmRelays.every(url => DEFAULT_RELAYS.includes(url)) && (
-                      <span className="text-[8px] font-bold text-amber-500 uppercase tracking-tighter animate-pulse">Add custom relays for better privacy</span>
-                    )}
-                  </div>
-                  <div className="space-y-3">
-                    <div className="flex gap-2">
-                      <input 
-                        type="text" 
-                        value={newRelayUrl}
-                        onChange={(e) => setNewRelayUrl(e.target.value)}
-                        placeholder="wss://relay.example.com"
-                        className="flex-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors"
-                        onKeyDown={(e) => e.key === 'Enter' && addRelay()}
-                      />
-                      <button 
-                        onClick={addRelay}
-                        className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
-                      >
-                        Add
-                      </button>
-                    </div>
-
-                    {userDmRelays.every(url => DEFAULT_RELAYS.includes(url)) && (
-                      <div className="p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-500/20">
-                        <p className="text-[10px] text-amber-700 dark:text-amber-400 leading-relaxed">
-                          <span className="font-bold uppercase block mb-1">Optimal Functionality Tip</span>
-                          You are currently using only default relays. Adding custom DM relays (like your own or smaller community relays) can significantly improve your privacy and message reliability.
-                        </p>
-                      </div>
-                    )}
-
-                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
-                      {userDmRelays.length > 0 ? (
-                        userDmRelays.map(url => {
-                          const info = relayInfoCache[url];
-                          const isDefault = DEFAULT_RELAYS.includes(url);
-                          return (
-                            <div key={url} className="flex items-center justify-between p-2 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 group">
-                              <div className="flex items-center gap-3 min-w-0">
-                                <div className="w-6 h-6 shrink-0 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 flex items-center justify-center overflow-hidden">
-                                  {info?.icon ? (
-                                    <img src={info.icon} alt="" className="w-full h-full object-contain" />
-                                  ) : (
-                                    <Zap size={12} className="text-zinc-300 dark:text-zinc-700" />
-                                  )}
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-2">
-                                    <p className="text-[10px] font-bold truncate">{info?.name || 'Relay'}</p>
-                                    {isDefault && (
-                                      <span className="text-[7px] px-1 bg-zinc-200 dark:bg-zinc-800 text-zinc-500 uppercase font-bold tracking-tighter">Default</span>
-                                    )}
-                                  </div>
-                                  <p className="text-[8px] text-zinc-500 font-mono truncate">{url}</p>
-                                </div>
-                              </div>
-                              <button 
-                                onClick={() => removeRelay(url)}
-                                className="p-1.5 text-zinc-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
-                              >
-                                <X size={14} />
-                              </button>
-                            </div>
-                          );
-                        })
-                      ) : (
-                        <div className="p-4 text-center border border-dashed border-zinc-200 dark:border-zinc-800 opacity-50">
-                          <p className="text-[10px] uppercase tracking-widest font-bold">No relays configured</p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Media Servers (Blossom)</p>
+                {settingsTab === 'blossom' && (
+                  <div className="space-y-6">
+                    <div className="space-y-4">
+                      <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Media Servers (Blossom)</p>
                     <button 
                       onClick={() => saveBlossomServers(userBlossomServers)}
                       className="text-[8px] font-bold text-emerald-500 uppercase tracking-widest hover:underline"
@@ -3563,7 +3947,7 @@ export default function App() {
                         value={newBlossomUrl}
                         onChange={(e) => setNewBlossomUrl(e.target.value)}
                         placeholder="https://blossom.example.com"
-                        className="flex-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors"
+                        className="flex-1 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors slanted-box"
                         onKeyDown={(e) => e.key === 'Enter' && addBlossomServer()}
                       />
                       <button 
@@ -3603,58 +3987,8 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+              )}
 
-                <div className="space-y-4">
-                  <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Preferences</p>
-                  
-                  <div className="flex items-center justify-between">
-                    <div className="space-y-0.5">
-                      <p className="text-xs text-zinc-400">Send Delay (10s)</p>
-                      <p className="text-[8px] text-zinc-500 uppercase tracking-tighter">Undo window for sent messages</p>
-                    </div>
-                    <button 
-                      onClick={() => {
-                        const next = !sendDelayEnabled;
-                        setSendDelayEnabled(next);
-                        localStorage.setItem('pam_send_delay', String(next));
-                      }}
-                      className={`w-10 h-5 rounded-none transition-colors relative ${sendDelayEnabled ? 'bg-emerald-500' : 'bg-zinc-200 dark:bg-zinc-800'}`}
-                    >
-                      <div className={`absolute top-1 w-3 h-3 rounded-none transition-all ${sendDelayEnabled ? 'right-1 bg-white' : 'left-1 bg-zinc-400 dark:bg-zinc-600'}`} />
-                    </button>
-                  </div>
-
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-zinc-400">Enable Desktop Notifications</span>
-                    <button 
-                      onClick={() => {
-                        if (!notificationsEnabled) {
-                          Notification.requestPermission().then(p => {
-                            if (p === 'granted') {
-                              setNotificationsEnabled(true);
-                              localStorage.setItem('pam_notifications', 'true');
-                            }
-                          });
-                        } else {
-                          setNotificationsEnabled(false);
-                          localStorage.setItem('pam_notifications', 'false');
-                        }
-                      }}
-                      className={`w-10 h-5 rounded-none transition-colors relative ${notificationsEnabled ? 'bg-emerald-500' : 'bg-zinc-200 dark:bg-zinc-800'}`}
-                    >
-                      <div className={`absolute top-1 w-3 h-3 rounded-none transition-all ${notificationsEnabled ? 'right-1 bg-white' : 'left-1 bg-zinc-400 dark:bg-zinc-600'}`} />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="pt-4 space-y-3">
-                  <button 
-                    onClick={() => setShowLogoutWarning(true)}
-                    className="w-full py-4 bg-red-500/10 text-red-500 font-bold rounded-none border border-red-500/20 hover:bg-red-500/20 transition-colors flex items-center justify-center gap-2"
-                  >
-                    <RotateCcw size={18} /> Logout
-                  </button>
-                </div>
               </div>
             </motion.div>
           </div>

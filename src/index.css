@@ -90,3 +90,16 @@ body {
 .hexagon {
   clip-path: polygon(12.5% 12.5%, 87.5% 12.5%, 100% 50%, 87.5% 87.5%, 12.5% 87.5%, 0% 50%);
 }
+
+.slanted-box {
+  clip-path: polygon(
+    12px 0, 
+    calc(100% - 12px) 0, 
+    100% 12px, 
+    100% calc(100% - 12px), 
+    calc(100% - 12px) 100%, 
+    12px 100%, 
+    0 calc(100% - 12px), 
+    0 12px
+  );
+}
