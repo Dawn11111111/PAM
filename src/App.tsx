@@ -5,6 +5,7 @@ import {
   SimplePool, 
   Event,
   UnsignedEvent,
+  VerifiedEvent,
   finalizeEvent,
   getEventHash,
   verifyEvent,
@@ -229,7 +230,7 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
       let blob = await response.blob();
       
       // 2. Fix MIME type if generic or missing
-      const effectiveMimeType = mimeType || 'audio/webm';
+      const effectiveMimeType = mimeType || 'audio/mp4';
       if (blob.type === 'application/octet-stream' || !blob.type || (mimeType && blob.type !== mimeType)) {
         blob = new Blob([blob], { type: effectiveMimeType });
       }
@@ -246,7 +247,7 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
       try {
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         const rawData = audioBuffer.getChannelData(0);
-        const samples = 60;
+        const samples = 40;
         const blockSize = Math.floor(rawData.length / samples);
         const filteredData = [];
         for (let i = 0; i < samples; i++) {
@@ -261,7 +262,7 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
         setWaveform(filteredData.map(n => n * multiplier));
       } catch (decodeErr) {
         console.warn("Audio decoding for waveform failed:", decodeErr);
-        setWaveform(Array.from({ length: 60 }, () => Math.random() * 0.5 + 0.1));
+        setWaveform(Array.from({ length: 40 }, () => Math.random() * 0.5 + 0.1));
       } finally {
         await audioCtx.close();
       }
@@ -270,7 +271,7 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
       setCurrentSrc(localUrl);
     } catch (e) {
       console.warn("Audio processing failed, falling back to original src:", e);
-      setWaveform(Array.from({ length: 60 }, () => Math.random() * 0.5 + 0.1));
+      setWaveform(Array.from({ length: 40 }, () => Math.random() * 0.5 + 0.1));
       
       // Fallback to original src if fetch failed and it's not already a blob
       if (!src.startsWith('blob:')) {
@@ -332,7 +333,7 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
   };
 
   return (
-    <div className={`flex flex-col gap-2 min-w-[280px] p-2 ${isSelf ? 'text-white' : 'text-zinc-900 dark:text-zinc-100'}`}>
+    <div className={`flex flex-col gap-2 min-w-[200px] w-full p-2 ${isSelf ? 'text-white' : 'text-zinc-900 dark:text-zinc-100'}`}>
       <audio 
         key={currentSrc || 'no-src'}
         ref={audioRef} 
@@ -408,7 +409,7 @@ const AudioPlayer = ({ src, isSelf, initialDuration, mimeType }: { src: string; 
 
         <a 
           href={src} 
-          download={`voice-note-${Date.now()}.${mimeType?.split('/')[1]?.split(';')[0] || 'webm'}`}
+          download={`voice-note-${Date.now()}.${mimeType?.includes('mp4') ? 'm4a' : (mimeType?.split('/')[1]?.split(';')[0] || 'm4a')}`}
           className={`p-2 rounded-full transition-colors ${isSelf ? 'hover:bg-white/10 text-white/50 hover:text-white' : 'hover:bg-zinc-100 dark:hover:bg-zinc-900 text-zinc-400 hover:text-zinc-600'}`}
           title="Download Audio"
           onClick={(e) => e.stopPropagation()}
@@ -447,7 +448,14 @@ const DEFAULT_RELAYS = [
   'wss://relay.primal.net'
 ];
 
-const INDEXER_RELAYS = ['wss://purplepag.es', 'wss://relay.nos.social'];
+const INDEXER_RELAYS = [
+  'wss://purplepag.es', 
+  'wss://relay.nos.social', 
+  'wss://relay.nostr.band', 
+  'wss://nos.lol', 
+  'wss://relay.damus.io',
+  'wss://relay.snort.social'
+];
 
 const KIND_DM = 14;
 const KIND_SEAL = 13;
@@ -455,14 +463,16 @@ const KIND_GIFT_WRAP = 1059;
 const KIND_REVIEW = 1985; // NIP-85 Label
 const DEFAULT_BLOSSOM_SERVERS = [
   'https://blossom.primal.net',
-  'https://cdn.nostr.build',
+  'https://blossom.nostr.build',
   'https://nostr.download',
   'https://blossom.v0l.io',
   'https://blossom.lucas.online'
 ];
 
 const KIND_BLOSSOM_LIST = 10063;
-const KIND_RELAY_INFO = 30066; // NIP-66
+const KIND_RELAY_INFO = 30166; // NIP-66
+const KIND_DM_RELAYS = 10050;
+const KIND_RELAY_LIST = 10002;
 
 const parseTrustScore = (event: Event): NostrTrustScore | null => {
   // NIP-85 Label can use 'rating' tag or 'l' tag with 'trust' namespace
@@ -627,7 +637,51 @@ export default function App() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeChat, setActiveChat] = useState<string | null>(null);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [isSyncingMessages, setIsSyncingMessages] = useState(false);
+
+  const syncMessages = async () => {
+    if (!pubKey) return;
+    setIsSyncingMessages(true);
+    try {
+      const messageRelays = [...new Set([
+        ...DEFAULT_RELAYS, 
+        ...userDmRelays, 
+        ...userGeneralRelays,
+        ...viewingDmRelays,
+        ...viewingRelays
+      ])].slice(0, 30);
+      
+      console.log(`Manual sync: querying ${messageRelays.length} relays...`);
+      const validMessages = messages.filter(Boolean);
+      const latestMsg = validMessages.length > 0 ? validMessages.reduce((prev, curr) => prev.created_at > curr.created_at ? prev : curr) : null;
+      const since = latestMsg ? latestMsg.created_at + 1 : 0;
+
+      const events = await pool.current.querySync(messageRelays, {
+        kinds: [KIND_GIFT_WRAP],
+        '#p': [pubKey],
+        since,
+        limit: 500
+      });
+
+      if (events.length > 0) {
+        setPendingEncryptedEvents(prev => {
+          const existingIds = new Set(prev.filter(Boolean).map(e => e.id));
+          const newEvents = events.filter(e => e && !existingIds.has(e.id));
+          if (newEvents.length === 0) return prev;
+          setShowDecryptPrompt(true);
+          return [...prev.filter(Boolean), ...newEvents];
+        });
+        showToast(`Found ${events.length} new events`, "success");
+      } else {
+        showToast("No new messages found", "info");
+      }
+    } catch (err) {
+      console.error("Manual sync failed", err);
+      showToast("Sync failed", "error");
+    } finally {
+      setIsSyncingMessages(false);
+    }
+  };
   const [lastSyncTime, setLastSyncTime] = useState<number>(() => Number(localStorage.getItem('pam_last_sync')) || 0);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [searchQuery, setSearchQuery] = useState('');
@@ -653,7 +707,7 @@ export default function App() {
 
   const getDisplayName = (pk: string | null, profile?: NostrProfile) => {
     if (!pk) return 'Anonymous';
-    const contact = contacts.find(c => c.pubkey === pk);
+    const contact = contacts.filter(Boolean).find(c => c.pubkey === pk);
     if (contact?.petname) return contact.petname;
     return profile?.display_name || profile?.name || 'Anonymous';
   };
@@ -672,7 +726,7 @@ export default function App() {
 
   const [newMessage, setNewMessage] = useState('');
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<'general' | 'relays' | 'blossom'>('general');
+  const [settingsTab, setSettingsTab] = useState<'general' | 'relays' | 'blossom'>((localStorage.getItem('pam_settings_tab') as any) || 'general');
   const [showLogoutWarning, setShowLogoutWarning] = useState(false);
   const [showKeyInput, setShowKeyInput] = useState(false);
   const [keyInput, setKeyInput] = useState('');
@@ -719,7 +773,7 @@ export default function App() {
 
   useEffect(() => {
     if (selectedProfile) {
-      const contact = contacts.find(c => c.pubkey === selectedProfile);
+      const contact = contacts.filter(Boolean).find(c => c.pubkey === selectedProfile);
       setPetnameInput(contact?.petname || '');
       setIsEditingPetname(false);
     }
@@ -744,6 +798,10 @@ export default function App() {
     const saved = localStorage.getItem('pam_dm_relays');
     return saved ? JSON.parse(saved) : DEFAULT_RELAYS;
   });
+  const [userGeneralRelays, setUserGeneralRelays] = useState<string[]>(() => {
+    const saved = localStorage.getItem('pam_general_relays');
+    return saved ? JSON.parse(saved) : DEFAULT_RELAYS;
+  });
   const [relayDiscovery, setRelayDiscovery] = useState<Record<string, any>>({});
   const [deletedMessageIds, setDeletedMessageIds] = useState<Set<string>>(() => {
     const saved = localStorage.getItem('pam_deleted_messages');
@@ -759,6 +817,7 @@ export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingIntervalRef = useRef<number | null>(null);
   const [viewingRelays, setViewingRelays] = useState<string[]>([]);
+  const [viewingDmRelays, setViewingDmRelays] = useState<string[]>([]);
   const [isViewingDefaultRelays, setIsViewingDefaultRelays] = useState(false);
   const [relayInfoCache, setRelayInfoCache] = useState<Record<string, any>>({});
   const [newRelayUrl, setNewRelayUrl] = useState('');
@@ -870,7 +929,7 @@ export default function App() {
       }
     }
     if (signal?.aborted) return null;
-    const relays = customRelays || (userDmRelays.length > 0 ? [...new Set([...INDEXER_RELAYS, ...userDmRelays])] : INDEXER_RELAYS);
+    const relays = customRelays || (userGeneralRelays.length > 0 ? [...new Set([...INDEXER_RELAYS, ...userGeneralRelays])] : INDEXER_RELAYS);
     try {
       const event = await Promise.race([
         pool.current.get(relays, { kinds: [0], authors: [pk] }),
@@ -957,30 +1016,111 @@ export default function App() {
 
   useEffect(() => {
     if (selectedProfile) {
-      const existing = contacts.find(c => c.pubkey === selectedProfile)?.profile || 
+      const existing = contacts.filter(Boolean).find(c => c.pubkey === selectedProfile)?.profile || 
                        searchResults.find(r => r.pubkey === selectedProfile)?.profile;
-      if (existing) {
-        setViewingProfile(existing);
-      } else {
-        fetchProfile(selectedProfile).then(setViewingProfile);
-      }
-
-      // Fetch relays (Kind 10002)
-      pool.current.get(DEFAULT_RELAYS, { kinds: [10002], authors: [selectedProfile] }).then(ev => {
-        if (ev) {
-          const rs = ev.tags.filter(t => t[0] === 'r').map(t => t[1]);
+       const updateRelays = async (profile: any) => {
+        setIsSyncingMessages(true);
+        const searchRelays = [...new Set([...INDEXER_RELAYS, ...DEFAULT_RELAYS])];
+        
+        // 1. Fetch Relay List (Kind 10002)
+        const relayEv = await pool.current.get(searchRelays, { kinds: [KIND_RELAY_LIST], authors: [selectedProfile] });
+        let generalRelays = DEFAULT_RELAYS;
+        
+        if (relayEv) {
+          const rs = relayEv.tags.filter(t => t[0] === 'r').map(t => t[1]);
           setViewingRelays(rs);
           setIsViewingDefaultRelays(false);
           rs.forEach(fetchRelayInfo);
+          generalRelays = rs;
         } else {
-          setViewingRelays(DEFAULT_RELAYS);
-          setIsViewingDefaultRelays(true);
-          DEFAULT_RELAYS.forEach(fetchRelayInfo);
+          // Fallback to metadata relays if present (Kind 0)
+          if (profile?.relays && typeof profile.relays === 'object') {
+            const rs = Object.keys(profile.relays);
+            if (rs.length > 0) {
+              setViewingRelays(rs);
+              setIsViewingDefaultRelays(false);
+              rs.forEach(fetchRelayInfo);
+              generalRelays = rs;
+            } else {
+              setViewingRelays(DEFAULT_RELAYS);
+              setIsViewingDefaultRelays(true);
+              DEFAULT_RELAYS.forEach(fetchRelayInfo);
+            }
+          } else {
+            setViewingRelays(DEFAULT_RELAYS);
+            setIsViewingDefaultRelays(true);
+            DEFAULT_RELAYS.forEach(fetchRelayInfo);
+          }
         }
-      });
+
+        // 2. Fetch DM Relays (Kind 10050)
+        let dmEv = await pool.current.get(searchRelays, { kinds: [KIND_DM_RELAYS], authors: [selectedProfile] });
+        if (!dmEv && generalRelays.length > 0) {
+          dmEv = await pool.current.get(generalRelays, { kinds: [KIND_DM_RELAYS], authors: [selectedProfile] });
+        }
+
+        let contactDmRelays: string[] = [];
+        if (dmEv) {
+          contactDmRelays = dmEv.tags.filter(t => t[0] === 'r').map(t => t[1]);
+          setViewingDmRelays(contactDmRelays);
+          contactDmRelays.forEach(fetchRelayInfo);
+        } else {
+          // Fallback to metadata dm_relays if present (rare but possible)
+          if (profile?.dm_relays && Array.isArray(profile.dm_relays)) {
+            contactDmRelays = profile.dm_relays;
+            setViewingDmRelays(contactDmRelays);
+            contactDmRelays.forEach(fetchRelayInfo);
+          } else if (profile?.dm_relays && typeof profile.dm_relays === 'object') {
+            contactDmRelays = Object.keys(profile.dm_relays);
+            setViewingDmRelays(contactDmRelays);
+            contactDmRelays.forEach(fetchRelayInfo);
+          } else {
+            setViewingDmRelays([]);
+          }
+        }
+
+        // 3. Robust Retrieval: Query contact's relays for any missed messages
+        if (pubKey && selectedProfile) {
+          const allContactRelays = [...new Set([...contactDmRelays, ...generalRelays, ...DEFAULT_RELAYS])];
+          console.log(`Syncing missed messages from contact's relays (${allContactRelays.length})...`);
+          
+          const validMessages = messages.filter(Boolean);
+          const latestMsg = validMessages.length > 0 ? validMessages.reduce((prev, curr) => prev.created_at > curr.created_at ? prev : curr) : null;
+          const since = latestMsg ? Math.max(latestMsg.created_at + 1, lastSyncTime) : lastSyncTime;
+
+          const missedEvents = await pool.current.querySync(allContactRelays, {
+            kinds: [KIND_GIFT_WRAP],
+            '#p': [pubKey],
+            since,
+            limit: 100
+          });
+
+          if (missedEvents.length > 0) {
+            console.log(`Found ${missedEvents.length} missed events on contact's relays`);
+            setPendingEncryptedEvents(prev => {
+              const existingIds = new Set(prev.filter(Boolean).map(e => e.id));
+              const newEvents = missedEvents.filter(e => e && !existingIds.has(e.id));
+              if (newEvents.length === 0) return prev;
+              setShowDecryptPrompt(true);
+              return [...prev.filter(Boolean), ...newEvents];
+            });
+          }
+        }
+      };
+
+      if (existing) {
+        setViewingProfile(existing);
+        updateRelays(existing);
+      } else {
+        fetchProfile(selectedProfile).then(p => {
+          setViewingProfile(p);
+          updateRelays(p);
+        });
+      }
     } else {
       setViewingProfile(null);
       setViewingRelays([]);
+      setViewingDmRelays([]);
       setIsViewingDefaultRelays(false);
     }
   }, [selectedProfile, contacts, searchResults, fetchProfile, fetchRelayInfo]);
@@ -996,16 +1136,22 @@ export default function App() {
 
   const fetchRelayDiscovery = async () => {
     try {
-      const events = await pool.current.querySync(INDEXER_RELAYS, { kinds: [KIND_RELAY_INFO], limit: 50 });
+      const events = await pool.current.querySync(INDEXER_RELAYS, { kinds: [KIND_RELAY_INFO], limit: 100 });
       const discovery: Record<string, any> = {};
       events.forEach(ev => {
         const dTag = ev.tags.find(t => t[0] === 'd');
-        if (dTag) {
-          discovery[dTag[1]] = {
-            ...JSON.parse(ev.content),
-            pubkey: ev.pubkey,
-            created_at: ev.created_at
-          };
+        if (dTag && ev.content) {
+          try {
+            const data = JSON.parse(ev.content);
+            discovery[dTag[1]] = {
+              ...data,
+              pubkey: ev.pubkey,
+              created_at: ev.created_at
+            };
+          } catch (jsonErr) {
+            // Skip malformed events
+            console.warn("Skipping malformed NIP-66 event", ev.id, jsonErr);
+          }
         }
       });
       setRelayDiscovery(discovery);
@@ -1025,48 +1171,67 @@ export default function App() {
   }, [pendingImagePreview]);
 
   // NIP-42 Relay Authentication
+  const authenticatedRelays = useRef<Set<string>>(new Set());
+
+  const handleRelayAuth = useCallback(async (relay: Relay, challenge: string) => {
+    if (!pubKey || !loginMethod || authenticatedRelays.current.has(relay.url)) return;
+    
+    console.log(`Relay ${relay.url} requested AUTH with challenge: ${challenge}`);
+    try {
+      // NIP-42: The relay tag should match the URL used to connect.
+      // Some relays are picky about the trailing slash.
+      const normalizedRelayUrl = relay.url.endsWith('/') ? relay.url.slice(0, -1) : relay.url;
+      
+      await relay.auth(async (evt) => {
+        try {
+          // We override the relay tag to be more robust (some relays want it without trailing slash)
+          const tags = evt.tags.map(t => t[0] === 'relay' ? ['relay', normalizedRelayUrl] : t);
+          // Also add the original one just in case
+          if (normalizedRelayUrl !== relay.url) {
+            tags.push(['relay', relay.url]);
+          }
+          
+          const s = await signEvent({ ...evt, tags, pubkey: pubKey, created_at: Math.floor(Date.now() / 1000) - 2 } as UnsignedEvent);
+          if (!s || !s.sig || !s.id) throw new Error("Invalid signed event");
+          return s;
+        } catch (err) {
+          console.error(`AUTH signing failed for ${relay.url}`, err);
+          throw err;
+        }
+      });
+      authenticatedRelays.current.add(relay.url);
+      console.log(`Successfully authenticated with ${relay.url}`);
+      showToast(`Authenticated with ${relay.url.replace('wss://', '')}`, "info");
+    } catch (err) {
+      console.error(`Failed to sign AUTH event for ${relay.url}`, err);
+    }
+  }, [pubKey, loginMethod]);
+
+  // Ensure all relays in the pool have the auth handler
   useEffect(() => {
     if (!pubKey || !loginMethod) return;
 
-    const relays = [...new Set([...userDmRelays, ...DEFAULT_RELAYS, ...INDEXER_RELAYS, ...SEARCH_RELAYS])];
-    
-    relays.forEach(async (url) => {
+    const setupRelay = async (url: string) => {
       try {
         const relay = await pool.current.ensureRelay(url);
-        relay.onauth = async (challenge: string) => {
-          console.log(`Relay ${relay.url} requested AUTH with challenge: ${challenge}`);
-          try {
-            // Normalize relay URL for AUTH event (some relays are picky about trailing slashes)
-            const normalizedRelayUrl = relay.url.endsWith('/') ? relay.url.slice(0, -1) : relay.url;
-            const authEventTemplate = {
-              kind: 22242,
-              created_at: Math.floor(Date.now() / 1000),
-              tags: [
-                ['relay', normalizedRelayUrl],
-                ['challenge', challenge]
-              ],
-              content: ''
-            };
-            
-            let signed = await signEvent({ ...authEventTemplate, pubkey: pubKey } as UnsignedEvent);
-            
-            console.log("Sending AUTH event:", signed);
-            
-            if (!signed.sig || !signed.id) {
-              throw new Error("Bunker returned an unsigned or invalid event");
-            }
-
-            relay.auth(signed);
-            showToast(`Authenticated with ${relay.url}`, "info");
-          } catch (err) {
-            console.error(`Failed to sign AUTH event for ${relay.url}`, err);
-          }
-        };
+        relay.onauth = (challenge) => handleRelayAuth(relay, challenge);
       } catch (e) {
-        // Relay connection might fail, that's okay
+        // Ignore connection errors
       }
-    });
-  }, [pubKey, loginMethod, userDmRelays]);
+    };
+
+    const allRelays = [...new Set([
+      ...userDmRelays, 
+      ...userGeneralRelays, 
+      ...viewingDmRelays,
+      ...viewingRelays,
+      ...DEFAULT_RELAYS, 
+      ...INDEXER_RELAYS, 
+      ...SEARCH_RELAYS
+    ])];
+    
+    allRelays.forEach(setupRelay);
+  }, [pubKey, loginMethod, userDmRelays, userGeneralRelays, viewingDmRelays, viewingRelays, handleRelayAuth]);
 
   useEffect(() => {
     // No longer scrolling to bottom as newest messages are at the top
@@ -1075,6 +1240,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('pam_dm_relays', JSON.stringify(userDmRelays));
   }, [userDmRelays]);
+
+  useEffect(() => {
+    localStorage.setItem('pam_general_relays', JSON.stringify(userGeneralRelays));
+  }, [userGeneralRelays]);
 
   useEffect(() => {
     localStorage.setItem('pam_deleted_messages', JSON.stringify(Array.from(deletedMessageIds)));
@@ -1090,7 +1259,7 @@ export default function App() {
   // --- Logic ---
   const loadLocalData = async () => {
     const msgs = await localDb.messages.toArray();
-    const sortedMsgs = [...msgs].sort((a, b) => a.created_at - b.created_at);
+    const sortedMsgs = [...msgs].filter(Boolean).sort((a, b) => a.created_at - b.created_at);
     setMessages(sortedMsgs);
     
     // Rebuild conversations from messages to ensure accuracy
@@ -1098,7 +1267,7 @@ export default function App() {
     
     // Load existing conversations to preserve unreadCount and profile
     const existingConvs = await localDb.conversations.toArray();
-    existingConvs.forEach(c => {
+    existingConvs.filter(Boolean).forEach(c => {
       conversationMap[c.pubkey] = c;
     });
 
@@ -1116,7 +1285,7 @@ export default function App() {
       }
     });
 
-    const convs = Object.values(conversationMap);
+    const convs = Object.values(conversationMap).filter(Boolean);
     if (convs.length > 0) {
       localDb.conversations.bulkPut(convs);
     }
@@ -1129,63 +1298,108 @@ export default function App() {
 
   const importExistingData = async () => {
     if (!pubKey) return;
-    setIsSyncing(true);
+    setIsSyncingMessages(true);
     
     try {
-      // 1. Fetch Relay List (KIND 10002) first to know where to look
-      const relayEvent = await pool.current.get(DEFAULT_RELAYS, { kinds: [10002], authors: [pubKey] });
-      let searchRelays = DEFAULT_RELAYS;
+      // 1. Fetch User's Relay Lists (KIND 10002 and KIND 10050)
+      const searchRelays = [...new Set([...INDEXER_RELAYS, ...DEFAULT_RELAYS])];
+      let [relayEvent, dmRelayEvent] = await Promise.all([
+        pool.current.get(searchRelays, { kinds: [KIND_RELAY_LIST], authors: [pubKey] }),
+        pool.current.get(searchRelays, { kinds: [KIND_DM_RELAYS], authors: [pubKey] })
+      ]);
+
+      let userWriteRelays: string[] = [];
+      
       if (relayEvent) {
-        const writeRelays = relayEvent.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]);
-        if (writeRelays.length > 0) {
-          setUserDmRelays(writeRelays);
-          searchRelays = [...new Set([...DEFAULT_RELAYS, ...writeRelays])];
+        userWriteRelays = relayEvent.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]);
+        if (userWriteRelays.length > 0) {
+          setUserGeneralRelays(userWriteRelays);
+          // If 10002 was found but 10050 wasn't on indexers, try the discovered write relays
+          if (!dmRelayEvent) {
+            dmRelayEvent = await pool.current.get(userWriteRelays, { kinds: [KIND_DM_RELAYS], authors: [pubKey] });
+          }
+        }
+      }
+
+      if (dmRelayEvent) {
+        const dmRelays = dmRelayEvent.tags.filter(t => t[0] === 'r').map(t => t[1]);
+        if (dmRelays.length > 0) {
+          setUserDmRelays(dmRelays);
         }
       }
 
       // 2. Import Contacts (KIND 3)
-      const contactEvent = await pool.current.get(searchRelays, { kinds: [3], authors: [pubKey] });
+      const currentSearchRelays = [...new Set([...DEFAULT_RELAYS, ...userGeneralRelays, ...userDmRelays])];
+      const contactEvent = await pool.current.get(currentSearchRelays, { kinds: [3], authors: [pubKey] });
 
+      let contactList: Contact[] = [];
       if (contactEvent) {
-        const contactList: Contact[] = contactEvent.tags
+        contactList = contactEvent.tags
           .filter(t => t[0] === 'p')
           .map(t => ({
             pubkey: t[1],
             petname: t[3] || undefined
           }));
         setContacts(contactList);
-        
-        // Pre-fetch profiles for follows using discovered relays
-        contactList.forEach(async (contact) => {
-          const p = await fetchProfile(contact.pubkey, searchRelays);
-          if (p) {
-            setContacts(prev => prev.map(c => c.pubkey === contact.pubkey ? { ...c, profile: p } : c));
-          }
-        });
       }
 
-      // 3. Fetch Gift Wraps (KIND 1059) with 'since' filter for efficiency (Amethyst/Wisp style)
-      const latestMsg = messages.length > 0 ? messages.reduce((prev, curr) => prev.created_at > curr.created_at ? prev : curr) : null;
+      // 3. Robust Relay Gathering: Fetch relay lists for top contacts
+      // This helps find messages sent to their relays if we didn't self-wrap
+      const topContacts = contactList.slice(0, 15); // Limit to top 15 to avoid overhead
+      const contactRelayPromises = topContacts.map(async (c) => {
+        const [r10002, r10050] = await Promise.all([
+          pool.current.get(currentSearchRelays, { kinds: [KIND_RELAY_LIST], authors: [c.pubkey] }),
+          pool.current.get(currentSearchRelays, { kinds: [KIND_DM_RELAYS], authors: [c.pubkey] })
+        ]);
+        const relays: string[] = [];
+        if (r10002) relays.push(...r10002.tags.filter(t => t[0] === 'r').map(t => t[1]));
+        if (r10050) relays.push(...r10050.tags.filter(t => t[0] === 'r').map(t => t[1]));
+        return relays;
+      });
+
+      const discoveredContactRelays = (await Promise.all(contactRelayPromises)).flat();
+      
+      // 4. Fetch Gift Wraps (KIND 1059) from a broad set of relays
+      const validMessages = messages.filter(Boolean);
+      const latestMsg = validMessages.length > 0 ? validMessages.reduce((prev, curr) => prev.created_at > curr.created_at ? prev : curr) : null;
       const since = latestMsg ? Math.max(latestMsg.created_at + 1, lastSyncTime) : lastSyncTime;
       
-      const events = await pool.current.querySync(searchRelays, { 
+      const messageRelays = [...new Set([
+        ...DEFAULT_RELAYS, 
+        ...userDmRelays, 
+        ...userGeneralRelays,
+        ...discoveredContactRelays
+      ])].slice(0, 25); // Cap at 25 relays total for performance
+      
+      console.log(`Syncing messages from ${messageRelays.length} relays...`);
+      const events = await pool.current.querySync(messageRelays, { 
         kinds: [KIND_GIFT_WRAP], 
         '#p': [pubKey], 
         since,
-        limit: 500 
+        limit: 1000 
       });
       
       if (events.length > 0) {
+        console.log(`Found ${events.length} new encrypted events`);
         setPendingEncryptedEvents(events);
         setShowDecryptPrompt(true);
       } else {
         subscribeToMessages();
       }
+
+      // Pre-fetch profiles for follows in background
+      contactList.forEach(async (contact) => {
+        const p = await fetchProfile(contact.pubkey, currentSearchRelays);
+        if (p) {
+          setContacts(prev => prev.map(c => c.pubkey === contact.pubkey ? { ...c, profile: p } : c));
+        }
+      });
+
       setLastSyncTime(Math.floor(Date.now() / 1000));
     } catch (err) {
       console.error("Failed to import data:", err);
     } finally {
-      setIsSyncing(false);
+      setIsSyncingMessages(false);
     }
   };
 
@@ -1275,8 +1489,9 @@ export default function App() {
           };
           
           setMessages(prev => {
-            if (prev.some(m => m.id === msg.id)) return prev;
-            const next = [...prev, msg].sort((a, b) => a.created_at - b.created_at);
+            const filtered = prev.filter(Boolean);
+            if (filtered.some(m => m.id === msg.id)) return filtered;
+            const next = [...filtered, msg].sort((a, b) => a.created_at - b.created_at);
             localDb.messages.put(msg);
             updateConversation(msg);
             return next;
@@ -1299,7 +1514,10 @@ export default function App() {
 
   const subscribeToMessages = () => {
     if (!pubKey) return;
-    const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
+    // Listen on all user's relays (DM + General) to be robust
+    const relays = [...new Set([...userDmRelays, ...userGeneralRelays, ...DEFAULT_RELAYS])];
+    
+    console.log(`Subscribing to messages on ${relays.length} relays...`);
     const sub = pool.current.subscribeMany(relays, [
       { kinds: [KIND_GIFT_WRAP], '#p': [pubKey] }
     ], {
@@ -1343,7 +1561,7 @@ export default function App() {
             };
 
             if (notificationsEnabled && !msg.isSelf && activeChat !== msg.sender) {
-              const profile = conversations.find(c => c.pubkey === msg.sender)?.profile;
+              const profile = conversations.find(c => c && c.pubkey === msg.sender)?.profile;
               new Notification(profile?.name || 'New Message', {
                 body: msg.content,
                 icon: profile?.picture || '/pam-logo.png'
@@ -1351,8 +1569,9 @@ export default function App() {
             }
 
             setMessages(prev => {
-              if (prev.some(m => m.id === msg.id)) return prev;
-              const next = [...prev, msg].sort((a, b) => a.created_at - b.created_at);
+              const filtered = prev.filter(Boolean);
+              if (filtered.some(m => m.id === msg.id)) return filtered;
+              const next = [...filtered, msg].sort((a, b) => a.created_at - b.created_at);
               localDb.messages.put(msg);
               updateConversation(msg);
               return next;
@@ -1373,7 +1592,8 @@ export default function App() {
   const updateConversation = async (msg: Message) => {
     const otherPk = msg.isSelf ? msg.receiver : msg.sender;
     setConversations(prev => {
-      const existing = prev.find(c => c.pubkey === otherPk);
+      const filtered = prev.filter(Boolean);
+      const existing = filtered.find(c => c.pubkey === otherPk);
       const isNewer = !existing || msg.created_at >= existing.lastMessage.created_at;
       const updated: Conversation = {
         pubkey: otherPk,
@@ -1382,19 +1602,31 @@ export default function App() {
         profile: existing?.profile
       };
       localDb.conversations.put(updated);
-      const next = [updated, ...prev.filter(c => c.pubkey !== otherPk)];
-      if (!updated.profile) fetchProfile(otherPk).then(p => p && setConversations(curr => curr.map(c => c.pubkey === otherPk ? { ...c, profile: p } : c)));
+      const next = [updated, ...filtered.filter(c => c.pubkey !== otherPk)];
+      if (!updated.profile) fetchProfile(otherPk).then(p => p && setConversations(curr => curr.filter(Boolean).map(c => c.pubkey === otherPk ? { ...c, profile: p } : c)));
       return next;
     });
   };
 
-  const signEvent = async (template: UnsignedEvent): Promise<Event> => {
+  const signEvent = async (template: UnsignedEvent): Promise<VerifiedEvent> => {
     if (loginMethod === 'local' && privKey) return finalizeEvent(template, privKey);
-    if (loginMethod === 'nip07' && window.nostr) return window.nostr.signEvent(template);
+    if (loginMethod === 'nip07' && window.nostr) {
+      const signed = await window.nostr.signEvent(template);
+      if (!signed) throw new Error("User cancelled signing");
+      if (!signed.id) signed.id = getEventHash(signed);
+      return signed as VerifiedEvent;
+    }
     if (loginMethod === 'nip46' && bunkerSession) {
       const response = await nip46Request('sign_event', [JSON.stringify(template)]);
       try {
-        return typeof response === 'string' ? JSON.parse(response) : response;
+        const signed = typeof response === 'string' ? JSON.parse(response) : response;
+        if (!signed || !signed.sig) {
+          throw new Error("Bunker returned an unsigned or invalid event");
+        }
+        if (!signed.id) {
+          signed.id = getEventHash(signed);
+        }
+        return signed as VerifiedEvent;
       } catch (e) {
         console.error("Failed to parse signed event from Bunker", e, response);
         throw new Error("Bunker returned an invalid signed event format");
@@ -1490,7 +1722,7 @@ export default function App() {
     
     const getExtension = (mimeType: string) => {
       const m = mimeType.toLowerCase();
-      if (m.includes('mp4')) return '.mp4';
+      if (m.includes('mp4')) return '.m4a';
       if (m.includes('webm')) return '.webm';
       if (m.includes('mpeg') || m.includes('mp3')) return '.mp3';
       if (m.includes('ogg')) return '.ogg';
@@ -1541,6 +1773,8 @@ export default function App() {
         // Notify user we are signing
         setUploadProgress(0);
         
+        // NIP-126 standard is PUT /
+        // Some servers are picky about the trailing slash in the 'u' tag
         const uploadUrl = normalizedServer.endsWith('/') ? normalizedServer : `${normalizedServer}/`;
         
         const authEvent: UnsignedEvent = {
@@ -1558,112 +1792,69 @@ export default function App() {
         };
         
         const signedAuth = await signEvent(authEvent);
-        console.log(`Blossom Upload: Event signed, starting XHR...`);
-        // Use standard btoa for the JSON string.
+        console.log(`Blossom Upload: Event signed, starting upload to ${uploadUrl}...`);
+        
+        // Use UTF-8 safe btoa for the JSON string. Nostr events are ASCII-safe JSON but content might have emojis.
         const authHeader = btoa(unescape(encodeURIComponent(JSON.stringify(signedAuth))));
         
         // Clean content type (remove codecs which can confuse some servers)
         const contentType = blob.type.split(';')[0] || 'application/octet-stream';
 
-        // Use XHR for progress tracking
-        const uploadPromise = new Promise<string>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          uploadXhrRef.current = xhr;
-          
-          // NIP-126 standard is PUT /
-          console.log(`Blossom Upload: Sending PUT request to ${uploadUrl} with type ${contentType}`);
-          xhr.open('PUT', uploadUrl);
-          xhr.setRequestHeader('Authorization', `Nostr ${authHeader}`);
-          xhr.setRequestHeader('Content-Type', contentType);
-          
-          xhr.upload.onprogress = (event) => {
-            if (event.lengthComputable) {
-              const percentComplete = (event.loaded / event.total) * 100;
-              setUploadProgress(Math.round(percentComplete));
-            }
-          };
-
-          xhr.onabort = () => {
-            console.log(`Blossom Upload: Aborted on ${normalizedServer}`);
-            reject(new Error('Upload aborted by user'));
-          };
-
-          xhr.onload = async () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              try {
-                const result = JSON.parse(xhr.responseText);
-                console.log(`Blossom Upload: Success on ${normalizedServer}`, result);
-                let finalUrl = result.url || `${normalizedServer}/${hashHex}`;
-                if (ext && !finalUrl.toLowerCase().endsWith(ext)) {
-                  finalUrl += ext;
-                }
-                resolve(finalUrl);
-              } catch (e) {
-                console.warn(`Blossom Upload: Could not parse response from ${normalizedServer}, using fallback URL`);
-                resolve(`${normalizedServer}/${hashHex}${ext}`);
-              }
-            } else if ((xhr.status === 404 || xhr.status === 405) && !uploadUrl.endsWith(hashHex)) {
-              // Fallback for servers that require PUT /[hash] or return 405 on root PUT
-              console.warn(`Blossom Upload: Server ${normalizedServer} returned ${xhr.status} on root PUT, trying PUT /[hash]...`);
-              const hashUrl = `${normalizedServer.endsWith('/') ? normalizedServer : `${normalizedServer}/`}${hashHex}`;
-              
-              // We need to re-sign for the new URL
-              const newAuthEvent: UnsignedEvent = {
-                ...authEvent,
-                tags: authEvent.tags.map(t => t[0] === 'u' ? ['u', hashUrl] : t)
-              };
-              const newSignedAuth = await signEvent(newAuthEvent);
-              const newAuthHeader = btoa(unescape(encodeURIComponent(JSON.stringify(newSignedAuth))));
-              
-              const retryXhr = new XMLHttpRequest();
-              uploadXhrRef.current = retryXhr;
-              
-              retryXhr.open('PUT', hashUrl);
-              retryXhr.setRequestHeader('Authorization', `Nostr ${newAuthHeader}`);
-              retryXhr.setRequestHeader('Content-Type', blob.type || 'application/octet-stream');
-              
-              retryXhr.upload.onprogress = xhr.upload.onprogress;
-              retryXhr.onabort = xhr.onabort;
-              retryXhr.onload = () => {
-                if (retryXhr.status >= 200 && retryXhr.status < 300) {
-                  resolve(`${normalizedServer.endsWith('/') ? normalizedServer : `${normalizedServer}/`}${hashHex}${ext}`);
-                } else {
-                  reject(new Error(`Upload failed with status ${retryXhr.status}`));
-                }
-              };
-              retryXhr.onerror = () => reject(new Error('Network error during retry'));
-              retryXhr.send(blob);
-            } else {
-              console.error(`Blossom Upload: Server ${normalizedServer} returned status ${xhr.status}: ${xhr.responseText}`);
-              reject(new Error(`Upload failed with status ${xhr.status}`));
-            }
-          };
-
-          xhr.onerror = () => {
-            console.error(`Blossom Upload: Network error on ${normalizedServer}`);
-            reject(new Error('Network error during upload'));
-          };
-          
-          xhr.send(blob);
-        });
-
+        // Try fetch first for better CORS handling on some servers
         try {
-          const finalUrl = await uploadPromise;
-          setUploadProgress(100);
-          uploadXhrRef.current = null;
-          return finalUrl;
-        } catch (err) {
-          uploadXhrRef.current = null;
-          if (err instanceof Error && err.message === 'Upload aborted by user') {
-            throw err; // Propagate abort
+          const response = await fetch(uploadUrl, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Nostr ${authHeader}`,
+              'Content-Type': contentType
+            },
+            body: blob,
+            mode: 'cors',
+            credentials: 'omit'
+          });
+
+          if (response.ok) {
+            console.log(`Blossom Upload: Success on ${normalizedServer} via PUT /`);
+            setUploadProgress(100);
+            return `${normalizedServer}/${hashHex}${ext}`;
+          } else if (response.status === 404 || response.status === 405) {
+            console.warn(`Blossom Upload: Server ${normalizedServer} returned ${response.status} on root PUT, trying PUT /[hash]...`);
+            const hashUrl = `${normalizedServer.endsWith('/') ? normalizedServer : `${normalizedServer}/`}${hashHex}`;
+            
+            const newAuthEvent: UnsignedEvent = {
+              ...authEvent,
+              tags: authEvent.tags.map(t => t[0] === 'u' ? ['u', hashUrl] : t)
+            };
+            const newSignedAuth = await signEvent(newAuthEvent);
+            const newAuthHeader = btoa(unescape(encodeURIComponent(JSON.stringify(newSignedAuth))));
+            
+            const hashResponse = await fetch(hashUrl, {
+              method: 'PUT',
+              headers: {
+                'Authorization': `Nostr ${newAuthHeader}`,
+                'Content-Type': contentType
+              },
+              body: blob,
+              mode: 'cors',
+              credentials: 'omit'
+            });
+
+            if (hashResponse.ok) {
+              console.log(`Blossom Upload: Success on ${normalizedServer} via PUT /[hash]`);
+              setUploadProgress(100);
+              return `${normalizedServer}/${hashHex}${ext}`;
+            } else {
+              throw new Error(`Upload failed with status ${hashResponse.status}`);
+            }
+          } else {
+            throw new Error(`Upload failed with status ${response.status}`);
           }
-          console.error(`Blossom Upload: Failed to process ${normalizedServer}:`, err);
+        } catch (fetchErr: any) {
+          console.error(`Blossom Upload: Fetch error on ${normalizedServer}:`, fetchErr);
+          throw fetchErr;
         }
       } catch (err) {
-        if (err instanceof Error && err.message === 'Upload aborted by user') {
-          throw err; // Propagate abort out of the loop
-        }
-        console.error(`Blossom Upload: Outer error for ${normalizedServer}:`, err);
+        console.error(`Blossom Upload: Failed to process ${normalizedServer}:`, err);
       }
     }
     
@@ -1819,13 +2010,15 @@ export default function App() {
       }
       await Promise.allSettled(publishPromises);
       
-      setMessages(prev => prev.map(m => m.id === tempId ? { ...m, id: rumor.id } : m));
-      localDb.messages.put({ ...msg, id: rumor.id });
-      updateConversation({ ...msg, id: rumor.id });
+      if (rumor && rumor.id) {
+        setMessages(prev => prev.filter(Boolean).map(m => m.id === tempId ? { ...m, id: rumor.id } : m));
+        localDb.messages.put({ ...msg, id: rumor.id });
+        updateConversation({ ...msg, id: rumor.id });
+      }
     } catch (err) {
       console.error("Send failed", err);
       showToast("Failed to send message: " + (err instanceof Error ? err.message : String(err)), "error");
-      setMessages(prev => prev.filter(m => m.id !== tempId));
+      setMessages(prev => prev.filter(m => m && m.id !== tempId));
     } finally {
       setIsMining(false);
     }
@@ -1869,7 +2062,8 @@ export default function App() {
 
   useEffect(() => {
     userDmRelays.forEach(fetchRelayInfo);
-  }, [userDmRelays, fetchRelayInfo]);
+    userGeneralRelays.forEach(fetchRelayInfo);
+  }, [userDmRelays, userGeneralRelays, fetchRelayInfo]);
 
   const addRelay = async () => {
     if (!newRelayUrl.trim()) return;
@@ -1885,7 +2079,7 @@ export default function App() {
     setUserDmRelays(next);
     localStorage.setItem('pam_dm_relays', JSON.stringify(next));
     setNewRelayUrl('');
-    showToast("Relay added", "success");
+    showToast("DM Relay added", "success");
     fetchRelayInfo(url);
   };
 
@@ -1893,7 +2087,32 @@ export default function App() {
     const next = userDmRelays.filter(r => r !== url);
     setUserDmRelays(next);
     localStorage.setItem('pam_dm_relays', JSON.stringify(next));
-    showToast("Relay removed", "success");
+    showToast("DM Relay removed", "success");
+  };
+
+  const addGeneralRelay = async () => {
+    if (!newRelayUrl.trim()) return;
+    let url = newRelayUrl.trim();
+    if (!url.startsWith('wss://') && !url.startsWith('ws://')) {
+      url = 'wss://' + url;
+    }
+    if (userGeneralRelays.includes(url)) {
+      showToast("Relay already added", "info");
+      return;
+    }
+    const next = [...userGeneralRelays, url];
+    setUserGeneralRelays(next);
+    localStorage.setItem('pam_general_relays', JSON.stringify(next));
+    setNewRelayUrl('');
+    showToast("General Relay added", "success");
+    fetchRelayInfo(url);
+  };
+
+  const removeGeneralRelay = (url: string) => {
+    const next = userGeneralRelays.filter(r => r !== url);
+    setUserGeneralRelays(next);
+    localStorage.setItem('pam_general_relays', JSON.stringify(next));
+    showToast("General Relay removed", "success");
   };
 
   const addBlossomServer = () => {
@@ -1933,13 +2152,13 @@ export default function App() {
       }
       
       const mimeTypes = [
-        'audio/webm;codecs=opus',
-        'audio/ogg;codecs=opus',
         'audio/mp4',
-        'audio/webm',
-        'audio/ogg',
         'audio/aac',
-        'audio/mpeg'
+        'audio/mpeg',
+        'audio/ogg;codecs=opus',
+        'audio/ogg',
+        'audio/webm;codecs=opus',
+        'audio/webm'
       ];
       const supportedType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || '';
       
@@ -1980,7 +2199,7 @@ export default function App() {
           recordingIntervalRef.current = null;
         }
         setIsRecording(false);
-        const finalType = mediaRecorder.mimeType || supportedType || 'audio/webm';
+        const finalType = mediaRecorder.mimeType || supportedType || 'audio/mp4';
         const blob = new Blob(chunks, { type: finalType });
         console.log(`Recording stopped. Final Type: ${finalType}, Total chunks: ${chunks.length}, Blob size: ${blob.size} bytes`);
         
@@ -2058,7 +2277,7 @@ export default function App() {
   const loginNip46 = async () => {
     if (!bunkerUri) return;
     try {
-      setIsSyncing(true);
+      setIsSyncingMessages(true);
       // Parse bunker URI: bunker://<pubkey>@<relay>?secret=<secret>
       const url = new URL(bunkerUri.replace('bunker://', 'https://'));
       const remotePubkey = url.username;
@@ -2096,7 +2315,7 @@ export default function App() {
             try {
               const decrypted = nip44.decrypt(ev.content, nip44.getConversationKey(localPrivkey, remotePubkey));
               const resp = JSON.parse(decrypted);
-              if (resp.id === id) {
+              if (resp && resp.id === id) {
                 sub.close();
                 if (resp.error) reject(new Error(resp.error));
                 else resolve(resp.result);
@@ -2124,12 +2343,41 @@ export default function App() {
       alert(`Bunker login failed: ${err.message}`);
       setBunkerSession(null);
     } finally {
-      setIsSyncing(false);
+      setIsSyncingMessages(false);
     }
   };
 
+  useEffect(() => {
+    localStorage.setItem('pam_sidebar_tab', sidebarTab);
+  }, [sidebarTab]);
+
+  useEffect(() => {
+    localStorage.setItem('pam_settings_tab', settingsTab);
+  }, [settingsTab]);
+
   const logout = () => {
+    const keysToKeep = [
+      'pam_theme',
+      'pam_font_size',
+      'pam_font_family',
+      'pam_send_delay',
+      'pam_notifications',
+      'pam_sidebar_tab',
+      'pam_settings_tab'
+    ];
+    
+    const savedSettings: Record<string, string> = {};
+    keysToKeep.forEach(key => {
+      const val = localStorage.getItem(key);
+      if (val) savedSettings[key] = val;
+    });
+
     localStorage.clear();
+    
+    Object.entries(savedSettings).forEach(([key, val]) => {
+      localStorage.setItem(key, val);
+    });
+
     localDb.delete().then(() => window.location.reload());
   };
 
@@ -2151,14 +2399,14 @@ export default function App() {
     if (!pubKey) return;
     
     // If not following, this will follow them with a petname
-    const isFollowing = contacts.some(c => c.pubkey === pk);
+    const isFollowing = contacts.filter(Boolean).some(c => c.pubkey === pk);
     let newContacts: Contact[];
     
     if (isFollowing) {
-      newContacts = contacts.map(c => c.pubkey === pk ? { ...c, petname } : c);
+      newContacts = contacts.filter(Boolean).map(c => c.pubkey === pk ? { ...c, petname } : c);
     } else {
       const p = await fetchProfile(pk);
-      newContacts = [...contacts, { pubkey: pk, profile: p || undefined, petname }];
+      newContacts = [...contacts.filter(Boolean), { pubkey: pk, profile: p || undefined, petname }];
     }
     
     setContacts(newContacts);
@@ -2187,14 +2435,14 @@ export default function App() {
 
   const toggleFollow = async (pk: string) => {
     if (!pubKey) return;
-    const isFollowing = contacts.some(c => c.pubkey === pk);
+    const isFollowing = contacts.filter(Boolean).some(c => c.pubkey === pk);
     let newContacts: Contact[];
     
     if (isFollowing) {
-      newContacts = contacts.filter(c => c.pubkey !== pk);
+      newContacts = contacts.filter(Boolean).filter(c => c.pubkey !== pk);
     } else {
       const p = await fetchProfile(pk);
-      newContacts = [...contacts, { pubkey: pk, profile: p || undefined }];
+      newContacts = [...contacts.filter(Boolean), { pubkey: pk, profile: p || undefined }];
     }
     
     setContacts(newContacts);
@@ -2261,7 +2509,7 @@ export default function App() {
         .and(m => m.receiver === pk)
         .toArray();
       
-      const eventIdsToDelete = myMessages.map(m => m.id);
+      const eventIdsToDelete = myMessages.filter(m => m && m.id).map(m => m.id);
       
       if (eventIdsToDelete.length > 0) {
         // 2. Send Kind 5 Deletion request
@@ -2285,8 +2533,8 @@ export default function App() {
       await localDb.messages.where('receiver').equals(pk).delete();
       await localDb.conversations.delete(pk);
       
-      setMessages(prev => prev.filter(m => m.sender !== pk && m.receiver !== pk));
-      setConversations(prev => prev.filter(c => c.pubkey !== pk));
+      setMessages(prev => prev.filter(m => m && m.sender !== pk && m.receiver !== pk));
+      setConversations(prev => prev.filter(c => c && c.pubkey !== pk));
       
       if (activeChat === pk) setActiveChat(null);
       setSelectedProfile(null);
@@ -2304,8 +2552,8 @@ export default function App() {
       await localDb.messages.where('receiver').equals(pk).delete();
       await localDb.conversations.delete(pk);
       
-      setMessages(prev => prev.filter(m => m.sender !== pk && m.receiver !== pk));
-      setConversations(prev => prev.filter(c => c.pubkey !== pk));
+      setMessages(prev => prev.filter(m => m && m.sender !== pk && m.receiver !== pk));
+      setConversations(prev => prev.filter(c => c && c.pubkey !== pk));
       
       if (activeChat === pk) setActiveChat(null);
       setSelectedProfile(null);
@@ -2317,7 +2565,7 @@ export default function App() {
   };
 
   const getInboxRelaysOfPartners = async () => {
-    const pks = conversations.map(c => c.pubkey);
+    const pks = conversations.filter(Boolean).map(c => c.pubkey);
     if (pks.length === 0) return [];
     
     try {
@@ -2379,7 +2627,7 @@ export default function App() {
   };
 
   const getWoTPubkeys = async (signal?: AbortSignal) => {
-    const directFollows = contacts.map(c => c.pubkey);
+    const directFollows = contacts.filter(Boolean).map(c => c.pubkey);
     if (directFollows.length === 0 || signal?.aborted) return { secondDegree: [], followMap: {} };
     
     try {
@@ -2441,7 +2689,7 @@ export default function App() {
     if (contact.petname) score += 500;
 
     // Direct follow is a very strong signal
-    const isFollowed = contacts.some(c => c.pubkey === contact.pubkey);
+    const isFollowed = contacts.filter(Boolean).some(c => c.pubkey === contact.pubkey);
     if (isFollowed) score += 300;
 
     if (!contact.profile) return score - 50;
@@ -2729,7 +2977,7 @@ export default function App() {
   }, [contacts, searchQuery]);
 
   const filteredConversations = useMemo(() => {
-    const list = !searchQuery.trim() ? conversations : new Fuse(conversations, {
+    const list = !searchQuery.trim() ? conversations.filter(Boolean) : new Fuse(conversations.filter(Boolean), {
       keys: ['profile.name', 'profile.display_name', 'profile.nip05', 'pubkey', 'lastMessage.content'],
       threshold: 0.3,
       ignoreLocation: true
@@ -2966,7 +3214,7 @@ export default function App() {
                             <CheckCircle size={10} className="text-emerald-500 shrink-0" title={`Verified: ${res.profile.nip05}`} />
                           )}
                           <ProfileBadges 
-                            isFollowed={contacts.some(c => c.pubkey === res.pubkey)}
+                            isFollowed={contacts.filter(Boolean).some(c => c.pubkey === res.pubkey)}
                             isPriority={res.isPriority}
                             isWoT={res.isWoT}
                             followedByCount={res.followedBy?.length}
@@ -2999,9 +3247,9 @@ export default function App() {
                         size={40} 
                         onClick={() => setSelectedProfile(contact.pubkey)}
                       />
-                      {conversations.find(c => c.pubkey === contact.pubkey)?.unreadCount > 0 && (
+                      {conversations.find(c => c && c.pubkey === contact.pubkey)?.unreadCount > 0 && (
                         <div className="absolute top-0 right-0 w-3.5 h-3.5 bg-emerald-500 text-white rounded-none text-[7px] font-bold flex items-center justify-center border-2 border-white dark:border-black z-10">
-                          {conversations.find(c => c.pubkey === contact.pubkey)?.unreadCount}
+                          {conversations.find(c => c && c.pubkey === contact.pubkey)?.unreadCount}
                         </div>
                       )}
                     </div>
@@ -3019,7 +3267,7 @@ export default function App() {
                         />
                       </div>
                       <p className="text-[10px] text-zinc-500 font-mono truncate">
-                        {getMessagePreview(conversations.find(c => c.pubkey === contact.pubkey)?.lastMessage) || formatNpub(contact.pubkey).slice(0, 16) + '...'}
+                        {getMessagePreview(conversations.find(c => c && c.pubkey === contact.pubkey)?.lastMessage) || formatNpub(contact.pubkey).slice(0, 16) + '...'}
                       </p>
                     </button>
                     <button 
@@ -3042,7 +3290,7 @@ export default function App() {
             <div className="p-2 space-y-1">
               {priorityPubkeys.length > 0 ? (
                 priorityPubkeys.map(pk => {
-                  const contact = contacts.find(c => c.pubkey === pk) || searchResults.find(r => r.pubkey === pk);
+                  const contact = contacts.filter(Boolean).find(c => c.pubkey === pk) || searchResults.find(r => r.pubkey === pk);
                   return (
                     <div 
                       key={pk} 
@@ -3054,9 +3302,9 @@ export default function App() {
                           size={40} 
                           onClick={() => setSelectedProfile(pk)}
                         />
-                        {conversations.find(c => c.pubkey === pk)?.unreadCount > 0 && (
+                        {conversations.find(c => c && c.pubkey === pk)?.unreadCount > 0 && (
                           <div className="absolute top-0 right-0 w-3.5 h-3.5 bg-emerald-500 text-white rounded-none text-[7px] font-bold flex items-center justify-center border-2 border-white dark:border-black z-10">
-                            {conversations.find(c => c.pubkey === pk)?.unreadCount}
+                            {conversations.find(c => c && c.pubkey === pk)?.unreadCount}
                           </div>
                         )}
                       </div>
@@ -3067,14 +3315,14 @@ export default function App() {
                         <div className="flex items-center gap-2 min-w-0">
                           <p className="text-sm font-bold truncate group-hover:text-amber-500 transition-colors shrink">{getDisplayName(pk, contact?.profile)}</p>
                           <ProfileBadges 
-                            isFollowed={contacts.some(c => c.pubkey === pk)}
+                            isFollowed={contacts.filter(Boolean).some(c => c.pubkey === pk)}
                             isPriority={true}
                             isWoT={wotPubkeys.includes(pk)}
                             followedByCount={wotFollowMap[pk]?.length}
                           />
                         </div>
                         <p className="text-[10px] text-zinc-500 font-mono truncate">
-                          {getMessagePreview(conversations.find(c => c.pubkey === pk)?.lastMessage) || formatNpub(pk).slice(0, 16) + '...'}
+                          {getMessagePreview(conversations.find(c => c && c.pubkey === pk)?.lastMessage) || formatNpub(pk).slice(0, 16) + '...'}
                         </p>
                       </button>
                       <button 
@@ -3118,7 +3366,7 @@ export default function App() {
                         <div className="flex items-center gap-2 min-w-0 flex-1">
                           <p className={`text-sm font-bold truncate shrink ${activeChat === conv.pubkey ? 'text-emerald-600 dark:text-emerald-400' : ''}`}>{getDisplayName(conv.pubkey, conv.profile)}</p>
                           <ProfileBadges 
-                            isFollowed={contacts.some(c => c.pubkey === conv.pubkey)}
+                            isFollowed={contacts.filter(Boolean).some(c => c.pubkey === conv.pubkey)}
                             isPriority={priorityPubkeys.includes(conv.pubkey)}
                             isWoT={wotPubkeys.includes(conv.pubkey)}
                             followedByCount={wotFollowMap[conv.pubkey]?.length}
@@ -3145,7 +3393,7 @@ export default function App() {
       </div>
 
       {/* Chat Area */}
-      <div className={`flex-1 flex flex-col bg-white dark:bg-black ${!activeChat ? 'hidden md:flex' : 'flex'}`}>
+      <div className={`flex-1 min-w-0 flex flex-col bg-white dark:bg-black ${!activeChat ? 'hidden md:flex' : 'flex'}`}>
         {!activeChat ? (
           <div className="flex-1 flex flex-col items-center justify-center p-12 text-center space-y-8">
             <PamIcon size={120} className="opacity-20 grayscale hover:grayscale-0 transition-all duration-500" />
@@ -3160,7 +3408,7 @@ export default function App() {
               <div className="flex items-center gap-4">
                 <button onClick={() => setActiveChat(null)} className="md:hidden p-2 text-zinc-400 dark:text-zinc-500 hover:text-emerald-500"><ArrowLeft size={20} /></button>
                 <HexagonAvatar 
-                  src={conversations.find(c => c.pubkey === activeChat)?.profile?.picture} 
+                  src={conversations.find(c => c && c.pubkey === activeChat)?.profile?.picture} 
                   size={40} 
                   onClick={() => setSelectedProfile(activeChat)}
                 />
@@ -3169,9 +3417,9 @@ export default function App() {
                   className="text-left group min-w-0"
                 >
                   <div className="flex items-center gap-2 min-w-0">
-                    <h2 className="font-bold text-base group-hover:text-emerald-500 transition-colors truncate shrink">{getDisplayName(activeChat, conversations.find(c => c.pubkey === activeChat)?.profile)}</h2>
+                    <h2 className="font-bold text-base group-hover:text-emerald-500 transition-colors truncate shrink">{getDisplayName(activeChat, conversations.find(c => c && c.pubkey === activeChat)?.profile)}</h2>
                     <ProfileBadges 
-                      isFollowed={contacts.some(c => c.pubkey === activeChat)}
+                      isFollowed={contacts.filter(Boolean).some(c => c.pubkey === activeChat)}
                       isPriority={priorityPubkeys.includes(activeChat!)}
                       isWoT={wotPubkeys.includes(activeChat!)}
                       followedByCount={wotFollowMap[activeChat!]?.length}
@@ -3180,13 +3428,23 @@ export default function App() {
                   <p className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono">{formatNpub(activeChat).slice(0, 24)}...</p>
                 </button>
               </div>
-              <button 
-                onClick={() => setActiveChat(null)} 
-                className="p-2 text-zinc-400 dark:text-zinc-500 hover:text-red-500 transition-colors"
-                title="Close Chat"
-              >
-                <X size={20} />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={syncMessages}
+                  disabled={isSyncingMessages}
+                  className={`p-2 rounded-full transition-colors ${isSyncingMessages ? 'animate-spin text-zinc-400' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500'}`}
+                  title="Sync Messages"
+                >
+                  <RotateCcw size={18} />
+                </button>
+                <button 
+                  onClick={() => setActiveChat(null)} 
+                  className="p-2 text-zinc-400 dark:text-zinc-500 hover:text-red-500 transition-colors"
+                  title="Close Chat"
+                >
+                  <X size={20} />
+                </button>
+              </div>
             </div>
 
             {/* Message Composer (Moved to Top) */}
@@ -3537,13 +3795,13 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-8 relative z-0">
-              {messages.filter(m => (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id))
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-8 relative z-0">
+              {messages.filter(m => m && (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id))
                 .sort((a, b) => b.created_at - a.created_at)
                 .map(msg => (
                 <div key={msg.id} className={`flex flex-col ${msg.isSelf ? 'items-end' : 'items-start'}`}>
                   <div 
-                    className={`max-w-[85%] md:max-w-[70%] px-5 py-3 rounded-none leading-relaxed slanted-box ${msg.isSelf ? 'bg-gradient-to-br from-zinc-800 via-zinc-900 to-black text-white shadow-lg shadow-black/20' : 'bg-gradient-to-br from-zinc-200 via-zinc-300 to-zinc-400 text-black border border-zinc-200 dark:border-zinc-800'}`}
+                    className={`max-w-[90%] md:max-w-[70%] px-4 md:px-5 py-3 rounded-none leading-relaxed slanted-box break-words whitespace-pre-wrap ${msg.isSelf ? 'bg-gradient-to-br from-zinc-800 via-zinc-900 to-black text-white shadow-lg shadow-black/20' : 'bg-gradient-to-br from-zinc-200 via-zinc-300 to-zinc-400 text-black border border-zinc-200 dark:border-zinc-800'}`}
                   >
                     {msg.type === 'image' ? (
                       <div className="space-y-2">
@@ -3694,13 +3952,13 @@ export default function App() {
                         <h3 className="text-xl font-black italic tracking-tighter truncate shrink">
                           {getDisplayName(selectedProfile!, viewingProfile)}
                         </h3>
-                        {contacts.find(c => c.pubkey === selectedProfile)?.petname && (
+                        {contacts.find(c => c && c.pubkey === selectedProfile)?.petname && (
                           <span className="text-[10px] text-zinc-400 dark:text-zinc-600 font-medium italic shrink-0">
                             ({viewingProfile?.display_name || viewingProfile?.name || 'Anonymous'})
                           </span>
                         )}
                         <ProfileBadges 
-                          isFollowed={contacts.some(c => c.pubkey === selectedProfile)}
+                          isFollowed={contacts.filter(Boolean).some(c => c.pubkey === selectedProfile)}
                           isPriority={priorityPubkeys.includes(selectedProfile!)}
                           isWoT={wotPubkeys.includes(selectedProfile!)}
                           followedByCount={wotFollowMap[selectedProfile!]?.length}
@@ -3748,7 +4006,7 @@ export default function App() {
                             onClick={() => setIsEditingPetname(true)}
                             className="text-[10px] font-bold text-zinc-400 hover:text-emerald-500 uppercase tracking-tighter flex items-center gap-1.5 transition-colors"
                           >
-                            <Type size={12} /> {contacts.find(c => c.pubkey === selectedProfile)?.petname ? 'Edit Petname' : 'Assign Petname'}
+                            <Type size={12} /> {contacts.find(c => c && c.pubkey === selectedProfile)?.petname ? 'Edit Petname' : 'Assign Petname'}
                           </button>
                         )}
                       </div>
@@ -3773,48 +4031,94 @@ export default function App() {
                       </div>
                     )}
 
-                      {viewingRelays.length > 0 && (
-                        <div className="mt-6 space-y-2">
+                      <div className="mt-6 space-y-4">
+                        <div className="space-y-2">
                           <div className="flex items-center justify-between">
-                            <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">DM Relays</p>
+                            <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Relay List (10002)</p>
                             {isViewingDefaultRelays && (
                               <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default fallback</span>
                             )}
                           </div>
-                          <div className="flex flex-wrap gap-2">
-                            {viewingRelays.map(url => {
-                              const info = relayInfoCache[url];
-                              const discovery = relayDiscovery[url.replace('wss://', '').replace('ws://', '')];
-                              return (
-                                <div key={url} className="flex items-center gap-2 px-2 py-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none group relative cursor-help" title={url}>
-                                  {info?.icon ? (
-                                    <img src={info.icon} alt="" className="w-3 h-3 object-contain shrink-0" />
-                                  ) : (
-                                    <Zap size={10} className={discovery ? 'text-emerald-500' : 'text-zinc-400'} />
-                                  )}
-                                  <span className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400 truncate max-w-[100px]">
-                                    {info?.name || url.replace('wss://', '').replace('ws://', '')}
-                                  </span>
-                                  {discovery && (
-                                    <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50 w-48 p-3 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-xl text-[9px] space-y-1">
-                                      <p className="font-bold uppercase tracking-widest border-b border-zinc-100 dark:border-zinc-900 pb-1 mb-1">Relay Discovery (NIP-66)</p>
-                                      <div className="flex justify-between"><span>Software:</span> <span className="font-mono">{discovery.software}</span></div>
-                                      <div className="flex justify-between"><span>Version:</span> <span className="font-mono">{discovery.version}</span></div>
-                                      {discovery.supported_nips && (
-                                        <div className="flex flex-wrap gap-1 mt-1">
-                                          {discovery.supported_nips.slice(0, 5).map((n: number) => (
-                                            <span key={n} className="px-1 bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">NIP-{n}</span>
-                                          ))}
-                                        </div>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
+                          {viewingRelays.length > 0 ? (
+                            <div className="flex flex-wrap gap-2">
+                              {viewingRelays.map(url => {
+                                const info = relayInfoCache[url];
+                                const discovery = relayDiscovery[url.replace('wss://', '').replace('ws://', '')];
+                                return (
+                                  <div key={url} className="flex items-center gap-2 px-2 py-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none group relative cursor-help" title={url}>
+                                    {info?.icon ? (
+                                      <img src={info.icon} alt="" className="w-3 h-3 object-contain shrink-0" />
+                                    ) : (
+                                      <Zap size={10} className={discovery ? 'text-emerald-500' : 'text-zinc-400'} />
+                                    )}
+                                    <span className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400 truncate max-w-[100px]">
+                                      {info?.name || url.replace('wss://', '').replace('ws://', '')}
+                                    </span>
+                                    {discovery && (
+                                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50 w-48 p-3 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-xl text-[9px] space-y-1">
+                                        <p className="font-bold uppercase tracking-widest border-b border-zinc-100 dark:border-zinc-900 pb-1 mb-1">Relay Discovery (NIP-66)</p>
+                                        <div className="flex justify-between"><span>Software:</span> <span className="font-mono">{discovery.software}</span></div>
+                                        <div className="flex justify-between"><span>Version:</span> <span className="font-mono">{discovery.version}</span></div>
+                                        {discovery.supported_nips && (
+                                          <div className="flex flex-wrap gap-1 mt-1">
+                                            {discovery.supported_nips.slice(0, 5).map((n: number) => (
+                                              <span key={n} className="px-1 bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">NIP-{n}</span>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <p className="text-[10px] text-zinc-400 italic">No general relays found</p>
+                          )}
                         </div>
-                      )}
+
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">DM Relays (10050)</p>
+                          </div>
+                          {viewingDmRelays.length > 0 ? (
+                            <div className="flex flex-wrap gap-2">
+                              {viewingDmRelays.map(url => {
+                                const info = relayInfoCache[url];
+                                const discovery = relayDiscovery[url.replace('wss://', '').replace('ws://', '')];
+                                return (
+                                  <div key={url} className="flex items-center gap-2 px-2 py-1 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none group relative cursor-help" title={url}>
+                                    {info?.icon ? (
+                                      <img src={info.icon} alt="" className="w-3 h-3 object-contain shrink-0" />
+                                    ) : (
+                                      <Zap size={10} className={discovery ? 'text-emerald-500' : 'text-zinc-400'} />
+                                    )}
+                                    <span className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400 truncate max-w-[100px]">
+                                      {info?.name || url.replace('wss://', '').replace('ws://', '')}
+                                    </span>
+                                    {discovery && (
+                                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50 w-48 p-3 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-xl text-[9px] space-y-1">
+                                        <p className="font-bold uppercase tracking-widest border-b border-zinc-100 dark:border-zinc-900 pb-1 mb-1">Relay Discovery (NIP-66)</p>
+                                        <div className="flex justify-between"><span>Software:</span> <span className="font-mono">{discovery.software}</span></div>
+                                        <div className="flex justify-between"><span>Version:</span> <span className="font-mono">{discovery.version}</span></div>
+                                        {discovery.supported_nips && (
+                                          <div className="flex flex-wrap gap-1 mt-1">
+                                            {discovery.supported_nips.slice(0, 5).map((n: number) => (
+                                              <span key={n} className="px-1 bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">NIP-{n}</span>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <p className="text-[10px] text-zinc-400 italic">No DM relays found (NIP-17/59)</p>
+                          )}
+                        </div>
+                      </div>
 
                     {/* Trust Scores Section */}
                     <div className="mt-8 space-y-4">
@@ -3832,7 +4136,7 @@ export default function App() {
                       
                       {viewingTrustScores.length > 0 ? (
                         <div className="space-y-3 max-h-48 overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800">
-                          {viewingTrustScores.map(score => (
+                          {viewingTrustScores.filter(Boolean).map(score => (
                             <div key={score.id} className="p-3 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none space-y-2">
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-1">
@@ -3881,12 +4185,12 @@ export default function App() {
                           if (selectedProfile) toggleFollow(selectedProfile);
                         }}
                         className={`flex-1 flex items-center justify-center gap-2 py-3 text-[10px] font-bold uppercase tracking-widest transition-all border disabled:opacity-50 disabled:cursor-not-allowed ${
-                          contacts.some(c => c.pubkey === selectedProfile)
+                          contacts.filter(Boolean).some(c => c.pubkey === selectedProfile)
                             ? 'bg-zinc-100 dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-red-50 dark:hover:bg-red-950/30 hover:text-red-500 hover:border-red-500/30'
                             : 'bg-emerald-500 border-emerald-500 text-white hover:bg-emerald-600 shadow-lg shadow-emerald-500/20'
                         }`}
                       >
-                        {contacts.some(c => c.pubkey === selectedProfile) ? (
+                        {contacts.filter(Boolean).some(c => c.pubkey === selectedProfile) ? (
                           <><UserMinus size={14} /> Unfollow</>
                         ) : (
                           <><UserPlus size={14} /> Follow</>
@@ -4136,55 +4440,110 @@ export default function App() {
 
                 {settingsTab === 'relays' && (
                   <div className="space-y-8">
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between">
-                        <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">My DM Relays</p>
-                        {userDmRelays.every(url => DEFAULT_RELAYS.includes(url)) && (
-                          <span className="text-[8px] font-bold text-amber-500 uppercase tracking-tighter animate-pulse">Add custom relays for better privacy</span>
-                        )}
-                      </div>
-                      <div className="space-y-3">
-                        <div className="flex gap-2">
-                          <input 
-                            type="text" 
-                            value={newRelayUrl}
-                            onChange={(e) => setNewRelayUrl(e.target.value)}
-                            placeholder="wss://relay.example.com"
-                            className="flex-1 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors slanted-box"
-                            onKeyDown={(e) => e.key === 'Enter' && addRelay()}
-                          />
-                          <button 
-                            onClick={addRelay}
-                            className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
-                          >
-                            Add
-                          </button>
+                    <div className="space-y-6">
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">General Relays (NIP-65)</p>
+                          {userGeneralRelays.every(url => DEFAULT_RELAYS.includes(url)) && (
+                            <span className="text-[8px] font-bold text-amber-500 uppercase tracking-tighter">Using defaults</span>
+                          )}
                         </div>
+                        <div className="space-y-3">
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              value={newRelayUrl}
+                              onChange={(e) => setNewRelayUrl(e.target.value)}
+                              placeholder="wss://relay.example.com"
+                              className="flex-1 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors slanted-box"
+                              onKeyDown={(e) => e.key === 'Enter' && addGeneralRelay()}
+                            />
+                            <button 
+                              onClick={addGeneralRelay}
+                              className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
+                            >
+                              Add
+                            </button>
+                          </div>
 
-                        <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
-                          {userDmRelays.map(url => {
-                            const info = relayInfoCache[url];
-                            const isDefault = DEFAULT_RELAYS.includes(url);
-                            return (
-                              <div key={url} className="flex items-center justify-between p-2 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 group">
-                                <div className="flex items-center gap-3 min-w-0">
-                                  <div className="w-6 h-6 shrink-0 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 flex items-center justify-center overflow-hidden">
-                                    {info?.icon ? (
-                                      <img src={info.icon} alt="" className="w-full h-full object-contain" />
-                                    ) : (
-                                      <Zap size={10} className="text-zinc-400" />
-                                    )}
+                          <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
+                            {userGeneralRelays.map(url => {
+                              const info = relayInfoCache[url];
+                              const isDefault = DEFAULT_RELAYS.includes(url);
+                              return (
+                                <div key={url} className="flex items-center justify-between p-2 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 group">
+                                  <div className="flex items-center gap-3 min-w-0">
+                                    <div className="w-6 h-6 shrink-0 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 flex items-center justify-center overflow-hidden">
+                                      {info?.icon ? (
+                                        <img src={info.icon} alt="" className="w-full h-full object-contain" />
+                                      ) : (
+                                        <Zap size={10} className="text-zinc-400" />
+                                      )}
+                                    </div>
+                                    <div className="min-w-0">
+                                      <p className="text-[10px] font-bold truncate">{info?.name || url.replace('wss://', '').replace('ws://', '')}</p>
+                                      <p className="text-[8px] text-zinc-500 font-mono truncate">{url}</p>
+                                    </div>
+                                    {isDefault && <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default</span>}
                                   </div>
-                                  <div className="min-w-0">
-                                    <p className="text-[10px] font-bold truncate">{info?.name || url.replace('wss://', '').replace('ws://', '')}</p>
-                                    <p className="text-[8px] text-zinc-500 font-mono truncate">{url}</p>
-                                  </div>
-                                  {isDefault && <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default</span>}
+                                  <button onClick={() => removeGeneralRelay(url)} className="p-2 text-zinc-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={14} /></button>
                                 </div>
-                                <button onClick={() => removeRelay(url)} className="p-2 text-zinc-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={14} /></button>
-                              </div>
-                            );
-                          })}
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">DM Relays (NIP-50/10050)</p>
+                          {userDmRelays.every(url => DEFAULT_RELAYS.includes(url)) && (
+                            <span className="text-[8px] font-bold text-amber-500 uppercase tracking-tighter animate-pulse">Add custom relays for better privacy</span>
+                          )}
+                        </div>
+                        <div className="space-y-3">
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              value={newRelayUrl}
+                              onChange={(e) => setNewRelayUrl(e.target.value)}
+                              placeholder="wss://relay.example.com"
+                              className="flex-1 bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-none px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-colors slanted-box"
+                              onKeyDown={(e) => e.key === 'Enter' && addRelay()}
+                            />
+                            <button 
+                              onClick={addRelay}
+                              className="px-4 py-2 bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
+                            >
+                              Add
+                            </button>
+                          </div>
+
+                          <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
+                            {userDmRelays.map(url => {
+                              const info = relayInfoCache[url];
+                              const isDefault = DEFAULT_RELAYS.includes(url);
+                              return (
+                                <div key={url} className="flex items-center justify-between p-2 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 group">
+                                  <div className="flex items-center gap-3 min-w-0">
+                                    <div className="w-6 h-6 shrink-0 bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 flex items-center justify-center overflow-hidden">
+                                      {info?.icon ? (
+                                        <img src={info.icon} alt="" className="w-full h-full object-contain" />
+                                      ) : (
+                                        <Zap size={10} className="text-zinc-400" />
+                                      )}
+                                    </div>
+                                    <div className="min-w-0">
+                                      <p className="text-[10px] font-bold truncate">{info?.name || url.replace('wss://', '').replace('ws://', '')}</p>
+                                      <p className="text-[8px] text-zinc-500 font-mono truncate">{url}</p>
+                                    </div>
+                                    {isDefault && <span className="text-[7px] px-1 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 uppercase font-bold tracking-tighter border border-zinc-200 dark:border-zinc-800">Default</span>}
+                                  </div>
+                                  <button onClick={() => removeRelay(url)} className="p-2 text-zinc-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={14} /></button>
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
                       </div>
                     </div>

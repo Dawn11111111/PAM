@@ -60,6 +60,7 @@ export const DEFAULT_DM_RELAYS = [
 ];
 
 export const KIND_DM_RELAYS = 10050;
+export const KIND_RELAY_LIST = 10002;
 
 export function formatNpub(pubkey: string): string {
   try {
