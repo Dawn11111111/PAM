@@ -454,7 +454,8 @@ const INDEXER_RELAYS = [
   'wss://relay.nostr.band', 
   'wss://nos.lol', 
   'wss://relay.damus.io',
-  'wss://relay.snort.social'
+  'wss://relay.snort.social',
+  'wss://relay.vertexlab.io'
 ];
 
 const KIND_DM = 14;
@@ -475,6 +476,7 @@ const KIND_DM_RELAYS = 10050;
 const KIND_RELAY_LIST = 10002;
 
 const parseTrustScore = (event: Event): NostrTrustScore | null => {
+  if (!event || !event.tags) return null;
   // NIP-85 Label can use 'rating' tag or 'l' tag with 'trust' namespace
   const ratingTag = event.tags.find(t => t[0] === 'rating');
   const labelTag = event.tags.find(t => t[0] === 'l' && t[2] === 'trust');
@@ -551,7 +553,8 @@ const SEARCH_RELAYS = [
   'wss://nos.lol',
   'wss://relay.snort.social',
   'wss://relay.damus.io',
-  'wss://purplerelay.com'
+  'wss://purplerelay.com',
+  'wss://relay.vertexlab.io'
 ];
 
 // --- Components ---
@@ -644,6 +647,7 @@ export default function App() {
     setIsSyncingMessages(true);
     try {
       const messageRelays = [...new Set([
+        ...INDEXER_RELAYS,
         ...DEFAULT_RELAYS, 
         ...userDmRelays, 
         ...userGeneralRelays,
@@ -760,6 +764,9 @@ export default function App() {
     }
     return DEFAULT_BLOSSOM_SERVERS;
   });
+  const [hasPublishedBlossomList, setHasPublishedBlossomList] = useState<boolean>(() => {
+    return localStorage.getItem('pam_has_blossom_list') === 'true';
+  });
   const [preferredBlossomServer, setPreferredBlossomServer] = useState<string | null>(() => localStorage.getItem('pam_preferred_blossom'));
   const [powDifficulty, setPowDifficulty] = useState(0);
   const [isMining, setIsMining] = useState(false);
@@ -858,11 +865,16 @@ export default function App() {
     const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
     const event = await pool.current.get(relays, { kinds: [KIND_BLOSSOM_LIST], authors: [pk] });
     if (event) {
+      setHasPublishedBlossomList(true);
+      localStorage.setItem('pam_has_blossom_list', 'true');
       const servers = event.tags.filter(t => t[0] === 'server').map(t => t[1]);
       if (servers.length > 0) {
         setUserBlossomServers(servers);
         localStorage.setItem('pam_blossom_servers', JSON.stringify(servers));
       }
+    } else {
+      setHasPublishedBlossomList(false);
+      localStorage.setItem('pam_has_blossom_list', 'false');
     }
   }, [userDmRelays]);
 
@@ -878,6 +890,8 @@ export default function App() {
     const signed = await signEvent(event);
     const relays = userDmRelays.length > 0 ? userDmRelays : DEFAULT_RELAYS;
     await publishWithTimeout(pool.current, relays, signed);
+    setHasPublishedBlossomList(true);
+    localStorage.setItem('pam_has_blossom_list', 'true');
     setUserBlossomServers(servers);
     localStorage.setItem('pam_blossom_servers', JSON.stringify(servers));
     showToast("Blossom servers saved", "success");
@@ -911,7 +925,7 @@ export default function App() {
         })
       ]);
       if (signal?.aborted) return [];
-      return events.map(parseTrustScore).filter((r): r is NostrTrustScore => r !== null);
+      return (events || []).filter(Boolean).map(parseTrustScore).filter((r): r is NostrTrustScore => r !== null);
     } catch (e) {
       if (e instanceof Error && e.message === 'AbortError') return [];
       console.warn("Fetch trust scores failed", e);
@@ -929,12 +943,12 @@ export default function App() {
       }
     }
     if (signal?.aborted) return null;
-    const relays = customRelays || (userGeneralRelays.length > 0 ? [...new Set([...INDEXER_RELAYS, ...userGeneralRelays])] : INDEXER_RELAYS);
+    const relays = customRelays || (userGeneralRelays.length > 0 ? [...new Set([...INDEXER_RELAYS, ...userGeneralRelays, ...userDmRelays])] : [...new Set([...INDEXER_RELAYS, ...DEFAULT_RELAYS])]);
     try {
       const event = await Promise.race([
         pool.current.get(relays, { kinds: [0], authors: [pk] }),
         new Promise<Event | null>((_, reject) => {
-          const timeoutId = setTimeout(() => reject(new Error('Profile fetch timeout')), 5000);
+          const timeoutId = setTimeout(() => reject(new Error('Profile fetch timeout')), 10000);
           signal?.addEventListener('abort', () => {
             clearTimeout(timeoutId);
             reject(new Error('AbortError'));
@@ -955,7 +969,7 @@ export default function App() {
       console.warn("Fetch profile failed", e);
     }
     return null;
-  }, [pubKey, userDmRelays]);
+  }, [pubKey, userDmRelays, userGeneralRelays]);
 
   // --- Effects ---
   const [viewingTrustScores, setViewingTrustScores] = useState<NostrTrustScore[]>([]);
@@ -1139,6 +1153,7 @@ export default function App() {
       const events = await pool.current.querySync(INDEXER_RELAYS, { kinds: [KIND_RELAY_INFO], limit: 100 });
       const discovery: Record<string, any> = {};
       events.forEach(ev => {
+        if (!ev) return;
         const dTag = ev.tags.find(t => t[0] === 'd');
         if (dTag && ev.content) {
           try {
@@ -1290,6 +1305,17 @@ export default function App() {
       localDb.conversations.bulkPut(convs);
     }
     setConversations(convs.sort((a, b) => b.lastMessage.created_at - a.lastMessage.created_at));
+
+    // Pre-fetch profiles for message partners if missing
+    convs.forEach(async (conv) => {
+      if (!conv.profile) {
+        const p = await fetchProfile(conv.pubkey);
+        if (p) {
+          setConversations(prev => prev.map(c => c.pubkey === conv.pubkey ? { ...c, profile: p } : c));
+          localDb.conversations.update(conv.pubkey, { profile: p });
+        }
+      }
+    });
   };
 
   useEffect(() => {
@@ -1302,35 +1328,73 @@ export default function App() {
     
     try {
       // 1. Fetch User's Relay Lists (KIND 10002 and KIND 10050)
-      const searchRelays = [...new Set([...INDEXER_RELAYS, ...DEFAULT_RELAYS])];
-      let [relayEvent, dmRelayEvent] = await Promise.all([
-        pool.current.get(searchRelays, { kinds: [KIND_RELAY_LIST], authors: [pubKey] }),
-        pool.current.get(searchRelays, { kinds: [KIND_DM_RELAYS], authors: [pubKey] })
-      ]);
+      // Include current relays in search to find updates
+      const searchRelays = [...new Set([...INDEXER_RELAYS, ...DEFAULT_RELAYS, ...userGeneralRelays, ...userDmRelays])];
+      console.log(`Searching for relay lists on ${searchRelays.length} relays...`);
+      
+      const relayEvents = await pool.current.querySync(searchRelays, { 
+        kinds: [KIND_RELAY_LIST, KIND_DM_RELAYS, 3], 
+        authors: [pubKey] 
+      });
 
-      let userWriteRelays: string[] = [];
+      let relayEvent = relayEvents.filter(e => e.kind === KIND_RELAY_LIST).sort((a, b) => b.created_at - a.created_at)[0];
+      let dmRelayEvent = relayEvents.filter(e => e.kind === KIND_DM_RELAYS).sort((a, b) => b.created_at - a.created_at)[0];
+      let contactEvent = relayEvents.filter(e => e.kind === 3).sort((a, b) => b.created_at - a.created_at)[0];
+
+      let discoveredGeneralRelays: string[] = [];
+      let discoveredDmRelays: string[] = [];
       
       if (relayEvent) {
-        userWriteRelays = relayEvent.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]);
-        if (userWriteRelays.length > 0) {
-          setUserGeneralRelays(userWriteRelays);
-          // If 10002 was found but 10050 wasn't on indexers, try the discovered write relays
-          if (!dmRelayEvent) {
-            dmRelayEvent = await pool.current.get(userWriteRelays, { kinds: [KIND_DM_RELAYS], authors: [pubKey] });
-          }
+        discoveredGeneralRelays = relayEvent.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]);
+        console.log("Discovered general relays from 10002:", discoveredGeneralRelays);
+      }
+
+      // Fallback to Kind 3 relays if Kind 10002 is missing
+      if (discoveredGeneralRelays.length === 0 && contactEvent && contactEvent.content) {
+        try {
+          const relaysObj = JSON.parse(contactEvent.content);
+          discoveredGeneralRelays = Object.keys(relaysObj).filter(url => url.startsWith('ws'));
+          console.log("Discovered general relays from KIND 3 fallback:", discoveredGeneralRelays);
+        } catch (e) {}
+      }
+
+      if (discoveredGeneralRelays.length > 0) {
+        setUserGeneralRelays(discoveredGeneralRelays);
+        localStorage.setItem('pam_general_relays', JSON.stringify(discoveredGeneralRelays));
+        
+        // If 10050 wasn't found on indexers/defaults, try the discovered general relays
+        if (!dmRelayEvent) {
+          const extraDmEvents = await pool.current.querySync(discoveredGeneralRelays, { kinds: [KIND_DM_RELAYS], authors: [pubKey] });
+          dmRelayEvent = extraDmEvents.sort((a, b) => b.created_at - a.created_at)[0];
         }
       }
 
       if (dmRelayEvent) {
-        const dmRelays = dmRelayEvent.tags.filter(t => t[0] === 'r').map(t => t[1]);
-        if (dmRelays.length > 0) {
-          setUserDmRelays(dmRelays);
+        discoveredDmRelays = dmRelayEvent.tags.filter(t => t[0] === 'r').map(t => t[1]);
+        console.log("Discovered DM relays from 10050:", discoveredDmRelays);
+        if (discoveredDmRelays.length > 0) {
+          setUserDmRelays(discoveredDmRelays);
+          localStorage.setItem('pam_dm_relays', JSON.stringify(discoveredDmRelays));
         }
+      } else {
+        console.warn("No KIND 10050 DM relay list found for user.");
       }
 
       // 2. Import Contacts (KIND 3)
-      const currentSearchRelays = [...new Set([...DEFAULT_RELAYS, ...userGeneralRelays, ...userDmRelays])];
-      const contactEvent = await pool.current.get(currentSearchRelays, { kinds: [3], authors: [pubKey] });
+      // Use the discovered relays immediately if we found them, otherwise fallback to defaults/saved
+      const currentSearchRelays = [...new Set([
+        ...INDEXER_RELAYS,
+        ...DEFAULT_RELAYS, 
+        ...discoveredGeneralRelays, 
+        ...discoveredDmRelays,
+        ...userGeneralRelays,
+        ...userDmRelays
+      ])];
+      
+      console.log(`Fetching contacts from ${currentSearchRelays.length} relays...`);
+      if (!contactEvent) {
+        contactEvent = await pool.current.get(currentSearchRelays, { kinds: [3], authors: [pubKey] });
+      }
 
       let contactList: Contact[] = [];
       if (contactEvent) {
@@ -1366,10 +1430,12 @@ export default function App() {
       
       const messageRelays = [...new Set([
         ...DEFAULT_RELAYS, 
-        ...userDmRelays, 
+        ...discoveredDmRelays, 
+        ...discoveredGeneralRelays,
+        ...userDmRelays,
         ...userGeneralRelays,
         ...discoveredContactRelays
-      ])].slice(0, 25); // Cap at 25 relays total for performance
+      ])].slice(0, 30); // Cap at 30 relays total for performance
       
       console.log(`Syncing messages from ${messageRelays.length} relays...`);
       const events = await pool.current.querySync(messageRelays, { 
@@ -1389,9 +1455,19 @@ export default function App() {
 
       // Pre-fetch profiles for follows in background
       contactList.forEach(async (contact) => {
-        const p = await fetchProfile(contact.pubkey, currentSearchRelays);
+        const p = await fetchProfile(contact.pubkey, false, currentSearchRelays);
         if (p) {
           setContacts(prev => prev.map(c => c.pubkey === contact.pubkey ? { ...c, profile: p } : c));
+        }
+      });
+
+      // Pre-fetch profiles for message partners in background
+      const currentConvs = await localDb.conversations.toArray();
+      currentConvs.filter(Boolean).forEach(async (conv) => {
+        const p = await fetchProfile(conv.pubkey, false, currentSearchRelays);
+        if (p) {
+          setConversations(prev => prev.map(c => c.pubkey === conv.pubkey ? { ...c, profile: p } : c));
+          localDb.conversations.update(conv.pubkey, { profile: p });
         }
       });
 
@@ -1439,11 +1515,11 @@ export default function App() {
     setIsDecrypting(true);
     
     for (const event of pendingEncryptedEvents) {
-      if (!event.content) continue;
+      if (!event || !event.content) continue;
       try {
         const sealStr = await nip44Decrypt(event.pubkey, event.content);
         const seal = JSON.parse(sealStr);
-        if (!seal.pubkey || !seal.content) {
+        if (!seal || !seal.pubkey || !seal.content) {
           console.warn("Invalid Seal structure for event", event.id);
           continue;
         }
@@ -1515,18 +1591,18 @@ export default function App() {
   const subscribeToMessages = () => {
     if (!pubKey) return;
     // Listen on all user's relays (DM + General) to be robust
-    const relays = [...new Set([...userDmRelays, ...userGeneralRelays, ...DEFAULT_RELAYS])];
+    const relays = [...new Set([...userDmRelays, ...userGeneralRelays, ...INDEXER_RELAYS, ...DEFAULT_RELAYS])].slice(0, 30);
     
     console.log(`Subscribing to messages on ${relays.length} relays...`);
     const sub = pool.current.subscribeMany(relays, [
       { kinds: [KIND_GIFT_WRAP], '#p': [pubKey] }
     ], {
       onevent: async (event) => {
-        if (!event.content) return;
+        if (!event || !event.content) return;
         try {
           const sealStr = await nip44Decrypt(event.pubkey, event.content);
           const seal = JSON.parse(sealStr);
-          if (!seal.pubkey || !seal.content) {
+          if (!seal || !seal.pubkey || !seal.content) {
             console.warn("Invalid Seal structure for event", event.id);
             return;
           }
@@ -1603,7 +1679,12 @@ export default function App() {
       };
       localDb.conversations.put(updated);
       const next = [updated, ...filtered.filter(c => c.pubkey !== otherPk)];
-      if (!updated.profile) fetchProfile(otherPk).then(p => p && setConversations(curr => curr.filter(Boolean).map(c => c.pubkey === otherPk ? { ...c, profile: p } : c)));
+      if (!updated.profile) fetchProfile(otherPk).then(p => {
+        if (p) {
+          setConversations(curr => curr.filter(Boolean).map(c => c.pubkey === otherPk ? { ...c, profile: p } : c));
+          localDb.conversations.update(otherPk, { profile: p });
+        }
+      });
       return next;
     });
   };
@@ -1667,6 +1748,7 @@ export default function App() {
         { kinds: [24133], authors: [remotePubkey], '#p': [getPublicKey(localPrivkey)] }
       ], {
         onevent: (ev) => {
+          if (!ev) return;
           try {
             const decrypted = nip44.decrypt(ev.content, nip44.getConversationKey(localPrivkey, remotePubkey));
             const response = JSON.parse(decrypted);
@@ -3450,6 +3532,29 @@ export default function App() {
             {/* Message Composer (Moved to Top) */}
             <div className="p-6 border-b border-zinc-200 dark:border-zinc-900 bg-white dark:bg-black sticky top-0 z-30">
               <div className="max-w-4xl mx-auto space-y-4">
+                {!hasPublishedBlossomList && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-4 bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-between gap-4 slanted-box"
+                  >
+                    <div className="flex items-center gap-3">
+                      <HardDrive size={16} className="text-emerald-500" />
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-600 dark:text-emerald-400">
+                        Media uploads disabled. Publish your Blossom Server list (Kind 10063) to enable.
+                      </p>
+                    </div>
+                    <button 
+                      onClick={() => {
+                        setSettingsTab('blossom');
+                        setShowSettings(true);
+                      }}
+                      className="px-3 py-1 bg-emerald-500 text-white text-[9px] font-bold uppercase tracking-widest hover:bg-emerald-600 transition-colors"
+                    >
+                      Setup Now
+                    </button>
+                  </motion.div>
+                )}
                 {Object.keys(pendingMessages).length > 0 && (
                   <div className="space-y-2">
                     {Object.keys(pendingMessages).map(id => {
@@ -3759,26 +3864,40 @@ export default function App() {
                   {!isRecording && !audioUrl && !pendingImagePreview && (
                     <button 
                       onClick={() => {
+                        if (!hasPublishedBlossomList) {
+                          setSettingsTab('blossom');
+                          setShowSettings(true);
+                          showToast("Please publish your Media Server list (Kind 10063) first", "info");
+                          return;
+                        }
                         if (!preferredBlossomServer) {
                           showToast("Please select a Media Server first", "info");
                           return;
                         }
                         document.getElementById('image-upload')?.click();
                       }} 
-                      className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${!preferredBlossomServer ? 'text-zinc-300 dark:text-zinc-800 cursor-not-allowed' : 'text-zinc-400 dark:text-zinc-500 hover:text-emerald-500'}`}
-                      title={preferredBlossomServer ? "Upload Image" : "Select a Media Server to upload"}
+                      className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${(!preferredBlossomServer || !hasPublishedBlossomList) ? 'text-zinc-300 dark:text-zinc-800 cursor-not-allowed' : 'text-zinc-400 dark:text-zinc-500 hover:text-emerald-500'}`}
+                      title={!hasPublishedBlossomList ? "Publish Kind 10063 to enable uploads" : (preferredBlossomServer ? "Upload Image" : "Select a Media Server to upload")}
                     >
-                      <ImageIcon size={20} className={!preferredBlossomServer ? 'opacity-50' : ''} />
+                      <ImageIcon size={20} className={(!preferredBlossomServer || !hasPublishedBlossomList) ? 'opacity-50' : ''} />
                     </button>
                   )}
 
                   {!isRecording && !audioUrl && !pendingImagePreview && (
                     <button 
-                      onClick={startRecording}
-                      className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${!preferredBlossomServer ? 'text-zinc-300 dark:text-zinc-800 cursor-not-allowed' : 'text-zinc-400 dark:text-zinc-500 hover:text-red-500'}`}
-                      title={preferredBlossomServer ? "Record Voice Message" : "Select a Media Server to record"}
+                      onClick={() => {
+                        if (!hasPublishedBlossomList) {
+                          setSettingsTab('blossom');
+                          setShowSettings(true);
+                          showToast("Please publish your Media Server list (Kind 10063) first", "info");
+                          return;
+                        }
+                        startRecording();
+                      }}
+                      className={`p-4 bg-zinc-100 dark:bg-zinc-900 rounded-none transition-colors ${(!preferredBlossomServer || !hasPublishedBlossomList) ? 'text-zinc-300 dark:text-zinc-800 cursor-not-allowed' : 'text-zinc-400 dark:text-zinc-500 hover:text-red-500'}`}
+                      title={!hasPublishedBlossomList ? "Publish Kind 10063 to enable recording" : (preferredBlossomServer ? "Record Voice Message" : "Select a Media Server to record")}
                     >
-                      <Mic size={20} className={!preferredBlossomServer ? 'opacity-50' : ''} />
+                      <Mic size={20} className={(!preferredBlossomServer || !hasPublishedBlossomList) ? 'opacity-50' : ''} />
                     </button>
                   )}
 
@@ -3796,7 +3915,7 @@ export default function App() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-8 relative z-0">
-              {messages.filter(m => m && (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id))
+              {messages.filter(m => m && m.id && (m.sender === activeChat || m.receiver === activeChat) && !deletedMessageIds.has(m.id))
                 .sort((a, b) => b.created_at - a.created_at)
                 .map(msg => (
                 <div key={msg.id} className={`flex flex-col ${msg.isSelf ? 'items-end' : 'items-start'}`}>
@@ -4041,7 +4160,7 @@ export default function App() {
                           </div>
                           {viewingRelays.length > 0 ? (
                             <div className="flex flex-wrap gap-2">
-                              {viewingRelays.map(url => {
+                              {viewingRelays.filter(Boolean).map(url => {
                                 const info = relayInfoCache[url];
                                 const discovery = relayDiscovery[url.replace('wss://', '').replace('ws://', '')];
                                 return (
@@ -4136,7 +4255,7 @@ export default function App() {
                       
                       {viewingTrustScores.length > 0 ? (
                         <div className="space-y-3 max-h-48 overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-zinc-200 dark:scrollbar-thumb-zinc-800">
-                          {viewingTrustScores.filter(Boolean).map(score => (
+                          {viewingTrustScores.filter(score => score && score.id).map(score => (
                             <div key={score.id} className="p-3 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-none space-y-2">
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-1">
@@ -4587,14 +4706,23 @@ export default function App() {
                 {settingsTab === 'blossom' && (
                   <div className="space-y-6">
                     <div className="space-y-4">
-                      <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Media Servers (Blossom)</p>
-                    <button 
-                      onClick={() => saveBlossomServers(userBlossomServers)}
-                      className="text-[8px] font-bold text-emerald-500 uppercase tracking-widest hover:underline"
-                    >
-                      Publish to Nostr
-                    </button>
-                  </div>
+                      <div className="flex items-center justify-between">
+                        <p className="text-[10px] font-bold text-zinc-400 dark:text-zinc-600 uppercase tracking-widest">Media Servers (Blossom)</p>
+                        <button 
+                          onClick={() => saveBlossomServers(userBlossomServers)}
+                          className={`text-[8px] font-bold uppercase tracking-widest hover:underline transition-all ${!hasPublishedBlossomList ? 'text-white bg-emerald-500 px-3 py-1.5 shadow-lg shadow-emerald-500/20' : 'text-emerald-500'}`}
+                        >
+                          {hasPublishedBlossomList ? 'Update Published List' : 'Publish List to Nostr (Kind 10063)'}
+                        </button>
+                      </div>
+                      {!hasPublishedBlossomList && (
+                        <div className="p-3 bg-amber-500/10 border border-amber-500/20">
+                          <p className="text-[9px] text-amber-600 dark:text-amber-400 font-bold uppercase tracking-widest">
+                            Action Required: You must publish your server list to enable image and voice note uploads.
+                          </p>
+                        </div>
+                      )}
+                    </div>
                   <div className="space-y-3">
                     <div className="flex gap-2">
                       <input 
